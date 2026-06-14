@@ -1,11 +1,13 @@
 use super::*;
 
+mod capture_url;
 mod resource_stats;
 #[cfg(test)]
 mod screenshot_tests;
 #[cfg(test)]
 mod status_tests;
 
+use capture_url::validate_capture_url;
 pub(crate) use resource_stats::publish_resource_stats;
 
 pub(crate) async fn write_route_file(target: &Path, contents: &str) -> anyhow::Result<()> {
@@ -397,40 +399,48 @@ pub(crate) async fn capture_screenshot_job(cfg: &Config, payload: &Value) -> any
         .unwrap_or(720);
     let output_dir = cfg.workdir.join("screenshots").join(job_id.to_string());
     tokio::fs::create_dir_all(&output_dir).await?;
-    let output_file = output_dir.join("screenshot.jpg");
-    let size_env = format!("HOSTLET_SCREENSHOT_SIZE={width}x{height}");
-    log(
-        cfg,
-        deployment_id,
-        "stdout",
-        "Capturing deployment screenshot.",
-    )
-    .await;
-    run_screenshotter_container(
-        job_id,
-        screenshotter_image(payload),
-        capture_url,
-        &size_env,
-        &output_file,
-    )
-    .await?;
-    let bytes = tokio::fs::read(&output_file)
-        .await
-        .context("screenshotter did not produce an image")?;
-    upload_screenshot(
-        cfg,
-        ScreenshotUpload {
-            app_id,
+    // All work after create_dir_all runs inside an async block so that
+    // output_dir is unconditionally removed on every exit path, mirroring
+    // run_screenshotter_container's own cleanup pattern.
+    let result: anyhow::Result<()> = async {
+        let output_file = output_dir.join("screenshot.jpg");
+        let size_env = format!("HOSTLET_SCREENSHOT_SIZE={width}x{height}");
+        log(
+            cfg,
             deployment_id,
+            "stdout",
+            "Capturing deployment screenshot.",
+        )
+        .await;
+        run_screenshotter_container(
             job_id,
-            width,
-            height,
-            capture_url: capture_url.to_string(),
-            bytes,
-        },
-    )
-    .await?;
-    let _ = tokio::fs::remove_dir_all(output_dir).await;
+            screenshotter_image(payload),
+            capture_url,
+            &size_env,
+            &output_file,
+        )
+        .await?;
+        let bytes = tokio::fs::read(&output_file)
+            .await
+            .context("screenshotter did not produce an image")?;
+        upload_screenshot(
+            cfg,
+            ScreenshotUpload {
+                app_id,
+                deployment_id,
+                job_id,
+                width,
+                height,
+                capture_url: capture_url.to_string(),
+                bytes,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    result?;
     log(
         cfg,
         deployment_id,
@@ -604,14 +614,6 @@ fn payload_uuid(payload: &Value, key: &str) -> Option<Uuid> {
         .get(key)
         .and_then(|value| value.as_str())
         .and_then(|value| Uuid::parse_str(value).ok())
-}
-
-fn validate_capture_url(value: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(value).context("capture_url must be an absolute URL")?;
-    match url.scheme() {
-        "http" | "https" => Ok(()),
-        _ => bail!("capture_url must use http or https"),
-    }
 }
 
 pub(crate) async fn health_targets(cfg: &Config) -> anyhow::Result<Vec<HealthTarget>> {
