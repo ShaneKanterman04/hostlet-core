@@ -1,6 +1,8 @@
 use super::*;
 
 pub(crate) const NO_NATIVE_BUILD_PLAN: &str = "No repository Dockerfile selected";
+pub(crate) const IMAGE_BUDGET_WARN_BYTES: i64 = 500_000_000;
+pub(crate) const IMAGE_BUDGET_MAX_BYTES: i64 = 1_000_000_000;
 /// Default attempt count.  Do NOT change — e2e test timing depends on this value.
 const HEALTH_CHECK_ATTEMPTS_DEFAULT: u16 = 30;
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
@@ -300,19 +302,73 @@ pub(crate) async fn image_size_bytes(image: &str) -> anyhow::Result<i64> {
 
 pub(crate) fn build_runtime_metadata(
     build: &BuildPlan,
+    image_ref: &str,
     build_duration_ms: u128,
     image_size_bytes: Option<i64>,
 ) -> Value {
-    json!({
-        "packagingStrategy": build.packaging_strategy.label(),
-        "generatedDockerfile": build.generated,
-        "detectedLanguage": null,
-        "detectedFramework": null,
-        "runtimeKind": null,
-        "packageManager": null,
-        "buildDurationMs": build_duration_ms,
-        "imageSizeBytes": image_size_bytes,
-    })
+    build_artifact_runtime_metadata(image_budget_runtime_metadata(
+        json!({
+            "imageRef": image_ref,
+            "packagingStrategy": build.packaging_strategy.label(),
+            "generatedDockerfile": build.generated,
+            "detectedLanguage": null,
+            "detectedFramework": null,
+            "runtimeKind": null,
+            "packageManager": null,
+            "buildDurationMs": build_duration_ms,
+            "imageSizeBytes": image_size_bytes,
+        }),
+        image_size_bytes,
+    ))
+}
+
+pub(crate) fn build_artifact_runtime_metadata(mut metadata: Value) -> Value {
+    let Some(image_ref) = metadata
+        .get("imageRef")
+        .and_then(Value::as_str)
+        .filter(|image_ref| !image_ref.trim().is_empty())
+        .map(str::to_owned)
+    else {
+        return metadata;
+    };
+    let Some(object) = metadata.as_object_mut() else {
+        return metadata;
+    };
+    object
+        .entry("buildArtifact")
+        .or_insert_with(|| json!({ "imageRef": image_ref }));
+    metadata
+}
+
+pub(crate) fn image_budget_runtime_metadata(
+    mut metadata: Value,
+    image_size_bytes: Option<i64>,
+) -> Value {
+    let status = image_budget_status(image_size_bytes);
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("imageBudgetStatus".into(), json!(status));
+        object.insert(
+            "imageBudgetWarnBytes".into(),
+            json!(IMAGE_BUDGET_WARN_BYTES),
+        );
+        object.insert("imageBudgetMaxBytes".into(), json!(IMAGE_BUDGET_MAX_BYTES));
+        metadata
+    } else {
+        json!({
+            "imageBudgetStatus": status,
+            "imageBudgetWarnBytes": IMAGE_BUDGET_WARN_BYTES,
+            "imageBudgetMaxBytes": IMAGE_BUDGET_MAX_BYTES,
+        })
+    }
+}
+
+pub(crate) fn image_budget_status(image_size_bytes: Option<i64>) -> &'static str {
+    match image_size_bytes {
+        Some(size) if size > IMAGE_BUDGET_MAX_BYTES => "over_budget",
+        Some(size) if size > IMAGE_BUDGET_WARN_BYTES => "warning",
+        Some(_) => "ok",
+        None => "unknown",
+    }
 }
 
 pub(crate) fn add_git_sync_runtime_metadata(
@@ -576,26 +632,66 @@ mod tests {
 
     #[test]
     fn build_runtime_metadata_records_build_time_and_image_size() {
-        let metadata = build_runtime_metadata(&test_build_plan(), 12_345, Some(149_422_080));
+        let metadata = build_runtime_metadata(
+            &test_build_plan(),
+            "hostlet/example:deployment",
+            12_345,
+            Some(149_422_080),
+        );
 
+        assert_eq!(metadata["imageRef"], "hostlet/example:deployment");
+        assert_eq!(
+            metadata["buildArtifact"]["imageRef"],
+            "hostlet/example:deployment"
+        );
         assert_eq!(metadata["packagingStrategy"], "dockerfile");
         assert_eq!(metadata["generatedDockerfile"], false);
         assert_eq!(metadata["buildDurationMs"], 12_345);
         assert_eq!(metadata["imageSizeBytes"], 149_422_080);
+        assert_eq!(metadata["imageBudgetStatus"], "ok");
+        assert_eq!(metadata["imageBudgetWarnBytes"], IMAGE_BUDGET_WARN_BYTES);
+        assert_eq!(metadata["imageBudgetMaxBytes"], IMAGE_BUDGET_MAX_BYTES);
     }
 
     #[test]
     fn build_runtime_metadata_records_unknown_image_size() {
-        let metadata = build_runtime_metadata(&test_build_plan(), 3_000, None);
+        let metadata =
+            build_runtime_metadata(&test_build_plan(), "hostlet/example:unknown", 3_000, None);
 
+        assert_eq!(metadata["imageRef"], "hostlet/example:unknown");
+        assert_eq!(
+            metadata["buildArtifact"]["imageRef"],
+            "hostlet/example:unknown"
+        );
         assert_eq!(metadata["packagingStrategy"], "dockerfile");
         assert_eq!(metadata["buildDurationMs"], 3_000);
         assert!(metadata["imageSizeBytes"].is_null());
+        assert_eq!(metadata["imageBudgetStatus"], "unknown");
+    }
+
+    #[test]
+    fn image_budget_status_classifies_thresholds() {
+        assert_eq!(image_budget_status(None), "unknown");
+        assert_eq!(image_budget_status(Some(IMAGE_BUDGET_WARN_BYTES)), "ok");
+        assert_eq!(
+            image_budget_status(Some(IMAGE_BUDGET_WARN_BYTES + 1)),
+            "warning"
+        );
+        assert_eq!(image_budget_status(Some(IMAGE_BUDGET_MAX_BYTES)), "warning");
+        assert_eq!(
+            image_budget_status(Some(IMAGE_BUDGET_MAX_BYTES + 1)),
+            "over_budget"
+        );
     }
 
     #[test]
     fn startup_runtime_metadata_preserves_build_metrics_and_records_boot_time() {
-        let metadata = build_runtime_metadata(&test_build_plan(), 2_000, Some(42_000));
+        let metadata = build_runtime_metadata(
+            &test_build_plan(),
+            "hostlet/example:startup",
+            2_000,
+            Some(42_000),
+        );
         let metadata = add_git_sync_runtime_metadata(metadata, 175);
         let metadata = add_build_plan_runtime_metadata(metadata, 45);
         let metadata = add_startup_runtime_metadata(metadata, 350, 1_250);

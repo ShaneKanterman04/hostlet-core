@@ -11,6 +11,7 @@ import {
   formatBytes,
   formatDuration,
   humanStatus,
+  imageBudgetLabel,
   socketLabel,
   statusHelp,
 } from "./deploymentStatus";
@@ -28,6 +29,9 @@ type RuntimeMetadata = {
   buildPlanDurationMs?: number | null;
   buildDurationMs?: number | null;
   imageSizeBytes?: number | null;
+  imageBudgetStatus?: string | null;
+  imageBudgetWarnBytes?: number | null;
+  imageBudgetMaxBytes?: number | null;
   composeUpDurationMs?: number | null;
   containerStartDurationMs?: number | null;
   healthCheckDurationMs?: number | null;
@@ -42,7 +46,23 @@ type Deployment = {
   commitSha?: string | null;
   failure?: string | null;
   runtimeMetadata?: RuntimeMetadata | null;
+  queue?: DeploymentQueue | null;
 };
+
+type DeploymentQueue = {
+  status: "queued" | "building" | "not_applicable";
+  position?: number | null;
+  deploysAhead?: number | null;
+  updatedAt?: string | null;
+};
+
+function queueMessage(queue?: DeploymentQueue | null) {
+  if (!queue || queue.status === "not_applicable") return null;
+  if (queue.status === "building") return "Your app is building now";
+  const deploysAhead = Math.max(0, queue.deploysAhead ?? 0);
+  if (deploysAhead === 0) return "You're next in line";
+  return `${deploysAhead} ${deploysAhead === 1 ? "deploy" : "deploys"} ahead of you`;
+}
 
 export default function DeploymentDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
@@ -55,6 +75,7 @@ export default function DeploymentDetail({ params }: { params: Promise<{ id: str
   const isCompose = metadata?.runtime === "compose";
   const packaging = isCompose ? "Docker Compose" : metadata?.packagingStrategy || "auto";
   const framework = isCompose ? metadata?.webService ? `service ${metadata.webService}` : "Compose service" : metadata?.detectedFramework || "Repository Dockerfile";
+  const queueText = queueMessage(deployment?.queue);
 
   return (
     <AppShell>
@@ -89,6 +110,7 @@ export default function DeploymentDetail({ params }: { params: Promise<{ id: str
                   })}
                 </div>
                 <p className="muted mt-4">{statusHelp(status)}</p>
+                {queueText && <Notice tone="neutral" className="mt-4" description={queueText} />}
               </Panel>
 
               {status === "success" && (
@@ -111,6 +133,7 @@ export default function DeploymentDetail({ params }: { params: Promise<{ id: str
                     <SummaryItem label="Build plan" value={formatDuration(metadata.buildPlanDurationMs)} />
                     <SummaryItem label="Build time" value={formatDuration(metadata.buildDurationMs)} />
                     <SummaryItem label="Image size" value={formatBytes(metadata.imageSizeBytes)} />
+                    <SummaryItem label="Image budget" value={imageBudgetLabel(metadata.imageBudgetStatus)} />
                     {isCompose && <SummaryItem label="Compose up" value={formatDuration(metadata.composeUpDurationMs)} />}
                     <SummaryItem label={isCompose ? "Startup" : "Container start"} value={formatDuration(metadata.containerStartDurationMs)} />
                     <SummaryItem label="Health wait" value={formatDuration(metadata.healthCheckDurationMs)} />
@@ -131,6 +154,7 @@ export default function DeploymentDetail({ params }: { params: Promise<{ id: str
               <LogViewer
                 lines={logs}
                 emptyText="Waiting for deployment logs..."
+                highlightFirstError={status === "failed"}
                 toolbar={
                   finished
                     ? <span>stream ended</span>

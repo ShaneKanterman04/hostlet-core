@@ -1,4 +1,5 @@
 use crate::crypto::{hash_token, nonempty_env, Crypto};
+use crate::deployment_policy::{DeploymentStatusPolicy, NoopDeploymentStatusPolicy};
 use crate::env::{bool_env, http_client, screenshot_dir, secret_from_env};
 use crate::rate_limit::RateLimiter;
 use crate::screenshots::{NoopScreenshotHooks, ScreenshotHooks};
@@ -56,6 +57,7 @@ pub struct AppState {
     pub public_web_url: String,
     pub screenshot_dir: PathBuf,
     pub screenshot_hooks: Arc<dyn ScreenshotHooks>,
+    pub deployment_status_policy: Arc<dyn DeploymentStatusPolicy>,
     pub allowed_web_origins: Vec<String>,
     pub base_domain: Option<String>,
     pub domain_prefix: String,
@@ -146,6 +148,7 @@ impl AppState {
             public_web_url,
             screenshot_dir,
             screenshot_hooks: Arc::new(NoopScreenshotHooks),
+            deployment_status_policy: Arc::new(NoopDeploymentStatusPolicy),
             allowed_web_origins,
             base_domain: base_domain(),
             domain_prefix: domain_prefix(),
@@ -166,6 +169,15 @@ impl AppState {
     #[cfg(test)]
     pub fn with_screenshot_hooks(mut self, hooks: Arc<dyn ScreenshotHooks>) -> Self {
         self.screenshot_hooks = hooks;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_deployment_status_policy(
+        mut self,
+        policy: Arc<dyn DeploymentStatusPolicy>,
+    ) -> Self {
+        self.deployment_status_policy = policy;
         self
     }
 }
@@ -260,14 +272,15 @@ async fn seed_local_server(
         .or_else(|_| std::env::var("LOCAL_SERVER_PUBLIC_IP"))
         .unwrap_or_else(|_| "127.0.0.1".into());
     sqlx::query(
-        "INSERT INTO servers (id,user_id,name,public_ip,kind,agent_token_hash,job_signing_secret_ciphertext,status)
-         VALUES ($1,NULL,'This machine',$2,'local',$3,$4,'offline')
+        "INSERT INTO servers (id,user_id,name,public_ip,kind,agent_token_hash,job_signing_secret_ciphertext,status,capabilities,draining,max_concurrent_apps,max_concurrent_builds)
+         VALUES ($1,NULL,'This machine',$2,'local',$3,$4,'offline',ARRAY['builder','app_runner']::TEXT[],false,8,1)
          ON CONFLICT (id) DO UPDATE SET
            agent_token_hash=EXCLUDED.agent_token_hash,
            job_signing_secret_ciphertext=EXCLUDED.job_signing_secret_ciphertext,
            kind='local',
            name='This machine',
-           public_ip=EXCLUDED.public_ip",
+           public_ip=EXCLUDED.public_ip,
+           capabilities=EXCLUDED.capabilities",
     )
     .bind(local_server_id)
     .bind(public_ip)

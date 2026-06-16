@@ -38,47 +38,6 @@ fn failed_deployment_status_event_keeps_runtime_metrics() {
 }
 
 #[test]
-fn inspect_container_state_accepts_running_container() {
-    assert_eq!(
-        inspect_container_state("true false false 0"),
-        Some(ContainerState::Running)
-    );
-}
-
-#[test]
-fn inspect_container_state_reports_restart_loop() {
-    let state = inspect_container_state("true true false 1").unwrap();
-
-    assert_eq!(
-        state.error_message(),
-        "container is restarting after exit code 1"
-    );
-}
-
-#[test]
-fn inspect_container_state_reports_oom_kill() {
-    let state = inspect_container_state("false false true 137").unwrap();
-
-    assert_eq!(state.error_message(), "container was OOM-killed");
-}
-
-#[test]
-fn inspect_container_state_reports_stopped_exit_code() {
-    let state = inspect_container_state("false false false 2").unwrap();
-
-    assert_eq!(
-        state.error_message(),
-        "container is not running; last exit code 2"
-    );
-}
-
-#[test]
-fn inspect_container_state_rejects_malformed_output() {
-    assert_eq!(inspect_container_state(""), None);
-    assert_eq!(inspect_container_state("true false"), None);
-}
-
-#[test]
 fn auto_start_waits_for_threshold_and_stopped_container() {
     let mut counts = HealthCounts::default();
     let stopped = health_probe_for_state(ContainerState::Stopped("0".into()));

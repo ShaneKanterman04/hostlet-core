@@ -4,11 +4,13 @@ pub mod auth;
 pub mod cleanup;
 pub mod crypto;
 pub mod deploy;
+pub mod deployment_policy;
 pub mod env;
 pub mod github;
 pub mod policies;
 pub mod rate_limit;
 pub mod screenshots;
+pub mod server_capacity;
 pub mod state;
 pub mod web;
 
