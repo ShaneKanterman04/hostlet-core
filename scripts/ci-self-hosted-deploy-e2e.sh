@@ -464,6 +464,106 @@ JSON
   expect_status 404 -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/apps/${railpack_app_id}"
 }
 
+# deploy_managed_addons_app: a normal web app with a Hostlet-managed Postgres
+# add-on. Create resolves it into a generated multi-service compose runtime; the
+# agent builds the web image with Railpack, interpolates it + the generated
+# secret into compose, and runs the stack. Asserts the per-service topology, that
+# the backing Postgres is unpublished, that the web app actually reaches Postgres
+# over the internal network via the injected DATABASE_URL, and that the secret
+# never leaks into the deploy logs.
+deploy_managed_addons_app() {
+  local payload app_payload app_id detail published_port logs db_status project delete_payload delete_job
+  payload="$(cat <<JSON
+{
+  "name":"ci-addons-postgres",
+  "repo_full_name":"${APP_REPO_FULL}",
+  "branch":"main",
+  "server_id":null,
+  "container_port":3000,
+  "health_path":"/health",
+  "domain":"",
+  "runtime_kind":"single",
+  "hostlet_config_path":"hostlet.yml",
+  "runtime_config":{"compose":{"addOns":[{"key":"postgres"}],"backingMemoryLimitMb":256,"backingCpuLimit":0.25}},
+  "root_directory":".",
+  "memory_limit_mb":512,
+  "cpu_limit":0.5,
+  "public_exposure":false,
+  "auto_deploy":false,
+  "deploy_after_create":false,
+  "env":[]
+}
+JSON
+)"
+  app_payload="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${ORIGIN_CSRF[@]}" "${JSON_CT[@]}" -X POST "${BASE_URL}/api/apps" --data "${payload}")"
+  app_id="$(printf '%s' "${app_payload}" | json_get id)"
+  CREATED_APP_IDS+=("${app_id}")
+  project="hostlet-app-${app_id//-/}"
+
+  # Create switched the app to a compose runtime with a generated stack.
+  detail="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/apps/${app_id}")"
+  printf '%s' "${detail}" | json_get runtimeKind | grep -q '^compose$'
+
+  deploy_payload="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${ORIGIN_CSRF[@]}" -X POST "${BASE_URL}/api/apps/${app_id}/deploy" --data '{}')"
+  deployment_id="$(printf '%s' "${deploy_payload}" | json_get deploymentId)"
+  wait_deployment_status "${deployment_id}"
+
+  detail="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/apps/${app_id}")"
+  published_port="$(printf '%s' "${detail}" | json_get currentDeployment.publishedPort)"
+  curl -fsS "http://127.0.0.1:${published_port}/health" | grep -q '^ok$'
+
+  # Two services reported: web (routed) + postgres (backing).
+  printf '%s' "${detail}" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+roles = {s["name"]: s["role"] for s in (d.get("services") or [])}
+assert roles.get("web") == "web", roles
+assert roles.get("postgres") == "backing", roles
+'
+
+  # The backing Postgres container has no host port; the web service publishes to loopback.
+  if docker ps --filter "label=com.docker.compose.project=${project}" --filter "label=hostlet.role=backing" --format '{{.Ports}}' | grep -q '\->'; then
+    echo "managed add-on backing service published a host port" >&2
+    exit 1
+  fi
+  docker ps --filter "label=com.docker.compose.project=${project}" --filter "label=hostlet.role=web" --format '{{.Ports}}' | grep -q '127.0.0.1'
+
+  # The backing Postgres carries the per-service caps from runtime_config
+  # (256 MB = 268435456 bytes; 0.25 CPU = 250000000 NanoCpus).
+  backing_container="$(docker ps --filter "label=com.docker.compose.project=${project}" --filter "label=hostlet.role=backing" --format '{{.Names}}' | head -1)"
+  backing_mem="$(docker inspect --format '{{.HostConfig.Memory}}' "${backing_container}")"
+  backing_cpus="$(docker inspect --format '{{.HostConfig.NanoCpus}}' "${backing_container}")"
+  if [ "${backing_mem}" != "268435456" ] || [ "${backing_cpus}" != "250000000" ]; then
+    echo "backing service caps not applied (mem=${backing_mem} nanocpus=${backing_cpus})" >&2
+    exit 1
+  fi
+
+  # The web app reaches Postgres via the injected DATABASE_URL (give PG time to accept).
+  db_status=""
+  for _ in $(seq 1 30); do
+    db_status="$(curl -fsS "http://127.0.0.1:${published_port}/db" || true)"
+    if [ "${db_status}" = "db-ok" ]; then break; fi
+    sleep 2
+  done
+  if [ "${db_status}" != "db-ok" ]; then
+    echo "web app could not reach managed Postgres via DATABASE_URL (last: ${db_status})" >&2
+    exit 1
+  fi
+
+  # The rendered connection secret never leaked into the deploy logs.
+  logs="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/deployments/${deployment_id}/logs")"
+  if printf '%s' "${logs}" | grep -Eq 'postgres://postgres:[^@[:space:]]+@postgres'; then
+    echo "managed add-on deploy logs leaked the rendered DATABASE_URL" >&2
+    exit 1
+  fi
+
+  delete_payload="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${ORIGIN_CSRF[@]}" "${JSON_CT[@]}" -X DELETE "${BASE_URL}/api/apps/${app_id}")"
+  delete_job="$(printf '%s' "${delete_payload}" | json_get jobId)"
+  wait_job_status "${delete_job}"
+  expect_status 404 -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/apps/${app_id}"
+  echo "managed add-ons (web + Postgres) E2E passed"
+}
+
 # ---------------------------------------------------------------------------
 # First-run setup + authenticate a CI user.
 # ---------------------------------------------------------------------------
@@ -513,6 +613,7 @@ create_payload="$(cat <<JSON
   "runtime_kind":"single",
   "hostlet_config_path":"hostlet.yml",
   "root_directory":".",
+  "runtime_config":{"dataMountPath":"/app/data"},
   "memory_limit_mb":512,
   "cpu_limit":0.5,
   "public_exposure":false,
@@ -542,6 +643,19 @@ published_port="$(printf '%s' "${app_detail}" | json_get currentDeployment.publi
 container_name="hostlet-app-${app_id}-${deployment_id}"
 wait_published_health_ok "${published_port}" "/health" "${container_name}"
 curl -fsS "http://127.0.0.1:${published_port}/" | grep -q 'hostlet-ci-v1-v1'
+
+# The single-service managed volume honors the declared data path: it mounts at
+# /app/data (runtime_config.dataMountPath) instead of the default /data, so apps
+# that persist to a non-/data dir keep their data on the managed volume.
+data_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Type}} {{.Name}}{{end}}{{end}}' "${container_name}")"
+if ! printf '%s' "${data_mount}" | grep -q "^volume hostlet-app-data-${app_id}$"; then
+  echo "expected managed volume hostlet-app-data-${app_id} mounted at /app/data, got '${data_mount}'" >&2
+  exit 1
+fi
+if docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "${container_name}" | grep -qx "/data"; then
+  echo "managed volume still mounted at /data despite dataMountPath=/app/data" >&2
+  exit 1
+fi
 
 logs_payload="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/deployments/${deployment_id}/logs")"
 printf '%s' "${logs_payload}" | grep -q 'Health check passed'
@@ -664,10 +778,17 @@ delete_job="$(printf '%s' "${delete_payload}" | json_get jobId)"
 wait_job_status "${delete_job}"
 expect_status 404 -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/apps/${app_id}"
 
-for fixture in "${RAILPACK_FIXTURES[@]}"; do
-  IFS=: read -r fixture_name repo_name health_path expected <<<"${fixture}"
-  deploy_railpack_fixture "${fixture_name}" "${repo_name}" "${health_path}" "${expected}"
-done
+# HOSTLET_E2E_SKIP_RAILPACK_FIXTURES=1 runs a focused subset (node + compose +
+# add-ons) without the seven per-language Railpack fixture deploys. CI leaves it
+# unset so the full matrix runs.
+if [ "${HOSTLET_E2E_SKIP_RAILPACK_FIXTURES:-}" = "1" ]; then
+  echo "skipping Railpack fixture deploys (HOSTLET_E2E_SKIP_RAILPACK_FIXTURES=1)"
+else
+  for fixture in "${RAILPACK_FIXTURES[@]}"; do
+    IFS=: read -r fixture_name repo_name health_path expected <<<"${fixture}"
+    deploy_railpack_fixture "${fixture_name}" "${repo_name}" "${health_path}" "${expected}"
+  done
+fi
 
 compose_payload="$(cat <<JSON
 {
@@ -719,6 +840,46 @@ if printf '%s' "${compose_logs}" | grep -q 'compose-secret-value-for-redaction';
   exit 1
 fi
 docker ps --filter "label=com.docker.compose.project=hostlet-app-${compose_app_id//-/}" --format '{{.Ports}}' | grep -q '127.0.0.1'
+
+# The fixture's web service persists to a relative host bind (./data:/app/data).
+# The agent must auto-map that to a managed *named* volume — never a host bind —
+# so assert the running web container mounts a volume (not a bind) at /app/data
+# and that the app can actually read back what it wrote there.
+compose_web_container="$(docker ps \
+  --filter "label=com.docker.compose.project=hostlet-app-${compose_app_id//-/}" \
+  --filter "label=com.docker.compose.service=web" --format '{{.ID}}' | head -1)"
+compose_web_mount_type="$(docker inspect -f \
+  '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Type}}{{end}}{{end}}' \
+  "${compose_web_container}")"
+if [ "${compose_web_mount_type}" != "volume" ]; then
+  echo "expected ./data to be auto-mapped to a managed named volume at /app/data, got mount type '${compose_web_mount_type}'" >&2
+  exit 1
+fi
+curl -fsS "http://127.0.0.1:${compose_published_port}/data" | grep -q '^persisted-ok$'
+
+# Storage quota: the agent measures managed-volume usage (docker system df -v) on
+# its slow loop and the API serves it on the app JSON. The web service wrote a
+# ~1 MB blob to /app/data, so poll for the first post-deploy sample, then assert
+# the meter's used (>0) and the default 5 GB limit (5368709120 bytes).
+compose_storage_used=0
+for _ in $(seq 1 18); do
+  compose_storage_detail="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${BASE_URL}/api/apps/${compose_app_id}")"
+  compose_storage_used="$(printf '%s' "${compose_storage_detail}" | json_get storageUsedBytes)"
+  if [ "${compose_storage_used:-0}" -gt 0 ] 2>/dev/null; then
+    break
+  fi
+  sleep 5
+done
+if ! [ "${compose_storage_used:-0}" -gt 0 ] 2>/dev/null; then
+  echo "agent did not report managed-volume storage usage for the compose app (got '${compose_storage_used}')" >&2
+  exit 1
+fi
+compose_storage_limit="$(printf '%s' "${compose_storage_detail}" | json_get storageLimitBytes)"
+if [ "${compose_storage_limit}" != "5368709120" ]; then
+  echo "expected the default 5 GB storage limit (5368709120), got '${compose_storage_limit}'" >&2
+  exit 1
+fi
+
 record_deployment_metric "e2e-compose-fullstack" "selfHostedDeployE2e" "${compose_detail}"
 
 compose_delete_payload="$(curl -fsS -H "cookie: ${AUTH_COOKIE}" "${ORIGIN_CSRF[@]}" "${JSON_CT[@]}" -X DELETE "${BASE_URL}/api/apps/${compose_app_id}")"
@@ -732,5 +893,8 @@ if docker network ls -q --filter "label=com.docker.compose.project=hostlet-app-$
   echo "compose project network leaked after app delete" >&2
   exit 1
 fi
+
+# Managed add-ons (web app + Hostlet-managed Postgres) — the Phase 1b path.
+deploy_managed_addons_app
 
 echo "self-hosted deploy E2E passed"

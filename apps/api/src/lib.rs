@@ -12,6 +12,7 @@ pub mod rate_limit;
 pub mod screenshots;
 pub mod server_capacity;
 pub mod state;
+pub mod storage;
 pub mod web;
 
 use axum::{
@@ -157,6 +158,7 @@ pub fn core_router(state: AppState) -> anyhow::Result<Router> {
         .route("/api/github/status", get(github::status))
         .route("/api/github/repos", get(github::repos))
         .route("/api/github/repo-inspect", post(github::repo_inspect))
+        .route("/api/addons", get(web::addons_catalog))
         .route("/api/cloudflare/status", get(web::cloudflare_status))
         .route("/api/system/version", get(web::system_version))
         .route("/api/system/backups/latest", get(web::backup_metadata))

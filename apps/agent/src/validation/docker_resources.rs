@@ -35,9 +35,14 @@ pub(crate) async fn compose_service_container(
     compose_file: &Path,
     override_file: &Path,
     service: &str,
+    envs: &[(&str, &str)],
 ) -> anyhow::Result<String> {
-    let output = command_output_in_dir(
+    // `docker compose ps` re-parses the compose files, so it needs the same
+    // `${VAR}` interpolation environment as `up` — otherwise a generated stack's
+    // `image: ${HOSTLET_WEB_IMAGE}` resolves to empty and the command fails.
+    let output = command_output_in_dir_env(
         dir,
+        envs,
         "docker",
         &[
             "compose",
@@ -80,14 +85,99 @@ pub(crate) async fn compose_service_container(
     Ok(name)
 }
 
-pub(crate) async fn command_output_in_dir(
+/// Best-effort runtime facts for every service in a deployed Compose project,
+/// as `DeploymentServiceReport`s the API persists into `deployment_services`.
+///
+/// Never fails the deploy: the declared service list comes from the compose
+/// file (so the web service is always present), and a service whose container
+/// can't be inspected is reported with null runtime detail rather than erroring.
+/// Per-service health and the web service's published port are filled in by the
+/// caller, which knows the health-check result and the host-published port.
+pub(crate) async fn compose_all_services(
     dir: &Path,
+    project: &str,
+    compose_file: &Path,
+    override_file: &Path,
+    compose_text: &str,
+    web_service: &str,
+    envs: &[(&str, &str)],
+) -> Vec<hostlet_contracts::DeploymentServiceReport> {
+    let declared = hostlet_contracts::compose::parse_compose_services(compose_text, web_service);
+    let mut services = Vec::with_capacity(declared.len());
+    for summary in declared {
+        let container = compose_service_container(
+            dir,
+            project,
+            compose_file,
+            override_file,
+            &summary.name,
+            envs,
+        )
+        .await
+        .ok();
+        let (image_tag, status) = match &container {
+            Some(name) => inspect_container_facts(name).await,
+            None => (None, None),
+        };
+        services.push(hostlet_contracts::DeploymentServiceReport {
+            name: summary.name,
+            role: summary.role,
+            container_name: container,
+            image_tag,
+            target_port: None,
+            published_port: None,
+            status,
+            health_status: None,
+        });
+    }
+    services
+}
+
+/// Reads a container's image and lifecycle status via `docker inspect`. Returns
+/// `(None, None)` on any failure — callers treat missing facts as "unknown".
+async fn inspect_container_facts(name: &str) -> (Option<String>, Option<String>) {
+    let output = command_output(
+        "docker",
+        &[
+            "inspect",
+            "-f",
+            "{{.State.Status}}\t{{.Config.Image}}",
+            name,
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    let Ok(output) = output else {
+        return (None, None);
+    };
+    if !output.status.success() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().splitn(2, '\t');
+    let status = parts
+        .next()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty());
+    let image = parts
+        .next()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty());
+    (image, status)
+}
+
+pub(crate) async fn command_output_in_dir_env(
+    dir: &Path,
+    envs: &[(&str, &str)],
     bin: &str,
     args: &[&str],
     timeout: Duration,
 ) -> anyhow::Result<Output> {
     let mut cmd = Command::new(bin);
     cmd.current_dir(dir).args(args).kill_on_drop(true);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
     match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(output) => output.with_context(|| format!("failed to start {bin}")),
         Err(_) => bail!("{bin} timed out after {} seconds", timeout.as_secs()),

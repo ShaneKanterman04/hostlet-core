@@ -149,6 +149,7 @@ pub(crate) async fn deploy_compose(
     domain: &str,
     fallback_health_path: &str,
     git_sync_duration_ms: u128,
+    web_image: Option<&str>,
 ) -> anyhow::Result<()> {
     ensure_docker_compose().await?;
     let build_dir = cfg.workdir.join("builds").join(deployment_id.to_string());
@@ -162,6 +163,13 @@ pub(crate) async fn deploy_compose(
     let web_service = &manifest.compose.web_service;
 
     let compose_text = tokio::fs::read_to_string(compose_file).await?;
+    // Auto-map relative host bind mounts (e.g. ./data:/app/data) onto managed
+    // named volumes so a repo that persists to a project-relative directory
+    // deploys unchanged while the host filesystem stays isolated. Absolute binds
+    // and the Docker socket are left intact for validate_compose_subset to
+    // reject. The rewritten file is what `docker compose` actually reads.
+    let compose_text = remap_host_binds_to_named_volumes(&compose_text)?;
+    tokio::fs::write(compose_file, &compose_text).await?;
     validate_compose_subset(&compose_text, web_service)?;
     let port = manifest.compose.port.unwrap_or(fallback_port as u16);
     validate_port(port as i64)?;
@@ -178,7 +186,7 @@ pub(crate) async fn deploy_compose(
     }
     tokio::fs::write(
         &override_file,
-        compose_override_yaml(web_service, port, app_id, deployment_id, &p),
+        compose_override_yaml(&compose_text, web_service, port, app_id, deployment_id, &p),
     )
     .await?;
     log(
@@ -188,19 +196,50 @@ pub(crate) async fn deploy_compose(
         &format!("Detected Hostlet Compose app. Project {project}, web service {web_service}."),
     )
     .await;
+    // The compose process environment supplies `${VAR}` interpolation: the
+    // app's env (so a generated add-on stack resolves e.g. ${POSTGRES_PASSWORD}
+    // from the encrypted store) plus HOSTLET_WEB_IMAGE for managed-add-ons apps
+    // whose web service was built from the repo. Secrets travel as the child
+    // process env, never as command args, so they are not logged — and `config`
+    // runs `--quiet` so the resolved (interpolated) compose is never printed.
+    let mut compose_env: Vec<(String, String)> = Vec::new();
+    if let Some(map) = p.get("env").and_then(|v| v.as_object()) {
+        for (key, value) in map {
+            if hostlet_contracts::valid_env_key(key) {
+                compose_env.push((key.clone(), value.as_str().unwrap_or_default().to_string()));
+            }
+        }
+    }
+    if let Some(web_image) = web_image {
+        compose_env.push((
+            hostlet_contracts::compose::WEB_IMAGE_ENV.to_string(),
+            web_image.to_string(),
+        ));
+    }
+    let compose_env_refs: Vec<(&str, &str)> = compose_env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let compose_up_started = Instant::now();
-    run_log_in_dir(
+    run_log_in_dir_env(
         &cfg,
         deployment_id,
         project_dir,
+        &compose_env_refs,
         "docker",
-        &compose_invocation(&project, compose_file, &override_file, &["config"])?,
+        &compose_invocation(
+            &project,
+            compose_file,
+            &override_file,
+            &["config", "--quiet"],
+        )?,
     )
     .await?;
-    run_log_in_dir(
+    run_log_in_dir_env(
         &cfg,
         deployment_id,
         project_dir,
+        &compose_env_refs,
         "docker",
         &compose_invocation(
             &project,
@@ -217,6 +256,7 @@ pub(crate) async fn deploy_compose(
         compose_file,
         &override_file,
         web_service,
+        &compose_env_refs,
     )
     .await?;
     let internal_port = docker_published_port(&container, port).await?;
@@ -239,10 +279,11 @@ pub(crate) async fn deploy_compose(
         match wait_health(&cfg, deployment_id, &container, internal_port, health_path).await {
             Ok(duration) => duration,
             Err(err) => {
-                let _ = run_log_in_dir(
+                let _ = run_log_in_dir_env(
                     &cfg,
                     deployment_id,
                     project_dir,
+                    &compose_env_refs,
                     "docker",
                     &compose_invocation(
                         &project,
@@ -337,6 +378,26 @@ pub(crate) async fn deploy_compose(
             format!("localhost:{internal_port}")
         });
     }
+    // Enumerate every service in the stack so the API can persist one
+    // `deployment_services` row per service and the UI can render a card each.
+    // The web service is the only one Hostlet health-checks and host-publishes,
+    // so its health/published port are overlaid here onto the best-effort facts.
+    let mut services = compose_all_services(
+        project_dir,
+        &project,
+        compose_file,
+        &override_file,
+        &compose_text,
+        web_service,
+        &compose_env_refs,
+    )
+    .await;
+    if let Some(web) = services.iter_mut().find(|svc| svc.name == *web_service) {
+        web.target_port = Some(port as i32);
+        web.published_port = Some(internal_port as i32);
+        web.health_status = Some("healthy".to_string());
+    }
+    let services_json = serde_json::to_value(&services).ok();
     status_extra(
         &cfg,
         deployment_id,
@@ -347,6 +408,7 @@ pub(crate) async fn deploy_compose(
             published_port: Some(internal_port),
             compose_project: Some(&project),
             runtime_metadata: Some(runtime_metadata),
+            services: services_json,
             ..StatusDetails::default()
         },
     )
@@ -550,16 +612,6 @@ pub(crate) async fn run_log(
     args: &[&str],
 ) -> anyhow::Result<()> {
     run_log_streamed(cfg, deployment_id, None, &[], bin, args).await
-}
-
-pub(crate) async fn run_log_in_dir(
-    cfg: &Config,
-    deployment_id: Uuid,
-    dir: &Path,
-    bin: &str,
-    args: &[&str],
-) -> anyhow::Result<()> {
-    run_log_streamed(cfg, deployment_id, Some(dir), &[], bin, args).await
 }
 
 pub(crate) async fn run_log_in_dir_env(

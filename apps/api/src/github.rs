@@ -14,10 +14,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use hostlet_contracts::compose::{detect_data_mount_path, with_data_mount_path};
 use hostlet_contracts::{parse_github_repo, valid_commit_sha};
 use inference::{
-    dockerfile_inspection, gitea_inspection, infer_dockerfile, infer_package_json, node_inspection,
-    railpack_inspection, unknown_inspection,
+    compose_inspection, dockerfile_inspection, gitea_inspection, infer_addons_from_compose,
+    infer_dockerfile, infer_package_json, infer_service_addons, manifest_dependency_tokens,
+    node_inspection, package_json_dependencies, railpack_inspection, unknown_inspection,
+    with_detected_services, DetectedServices,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -274,7 +277,57 @@ async fn inspect_repo(
         return Ok(gitea_inspection(repo, branch, default_branch));
     }
 
+    // An explicit `hostlet.yml` declaring a Compose runtime wins over the
+    // package.json/Dockerfile detectors: the repo owner has stated the app is
+    // multi-service. We preview the parsed service list and surface any
+    // safe-subset violations the agent would reject at deploy time.
+    if let Some(manifest_text) = github_file_text(state, repo, branch, "hostlet.yml", token).await?
+    {
+        if let Some(manifest) =
+            hostlet_contracts::compose::HostletComposeManifest::parse_compose(&manifest_text)
+        {
+            let compose_file = manifest.compose_file();
+            let (services, subset_warnings) =
+                match github_file_text(state, repo, branch, compose_file, token).await? {
+                    Some(compose_text) => (
+                        hostlet_contracts::compose::parse_compose_services(
+                            &compose_text,
+                            &manifest.compose.web_service,
+                        ),
+                        hostlet_contracts::compose::compose_subset_warnings(
+                            &compose_text,
+                            &manifest.compose.web_service,
+                        ),
+                    ),
+                    None => (
+                        Vec::new(),
+                        vec![format!(
+                            "hostlet.yml references compose file {compose_file}, which was not found in the repository."
+                        )],
+                    ),
+                };
+            return Ok(compose_inspection(
+                repo,
+                branch,
+                default_branch,
+                "hostlet.yml",
+                &manifest.compose,
+                &services,
+                &subset_warnings,
+            ));
+        }
+    }
+
     let dockerfile = github_file_text(state, repo, branch, "Dockerfile", token).await?;
+    // Auto-detected backing services come from two complementary signals: the
+    // repo's dependency manifests (per language, below) and a bare compose file's
+    // service images (one without a `hostlet.yml` — that explicit form already
+    // returned above). Both map to the vetted managed catalog (the repo's own
+    // images are never run on a shared host) and feed the same
+    // `runtime_config.compose.addOns` the create handler resolves into a
+    // generated multi-service stack.
+    let (compose_addons, data_mount_path) =
+        detect_compose_signals(state, repo, branch, token).await?;
 
     if let Some(package_text) = github_file_text(state, repo, branch, "package.json", token).await?
     {
@@ -293,41 +346,84 @@ async fn inspect_repo(
                 .await?
                 .is_some(),
         );
-        return Ok(node_inspection(
+        let base = node_inspection(
             repo,
             branch,
             default_branch,
             inference,
             dockerfile.is_some(),
+        );
+        let mut detected = infer_service_addons(&package_json_dependencies(&package_text));
+        detected.merge(&compose_addons);
+        return Ok(apply_data_mount_path(
+            with_detected_services(base, &detected),
+            data_mount_path.as_deref(),
         ));
     }
 
     if let Some(contents) = dockerfile {
         let inference = infer_dockerfile(&contents);
-        return Ok(dockerfile_inspection(
-            repo,
-            branch,
-            default_branch,
-            inference,
+        let base = dockerfile_inspection(repo, branch, default_branch, inference);
+        return Ok(apply_data_mount_path(
+            with_detected_services(base, &compose_addons),
+            data_mount_path.as_deref(),
         ));
     }
 
-    for (path, language) in [
-        ("requirements.txt", "Python"),
-        ("pyproject.toml", "Python"),
-        ("go.mod", "Go"),
-        ("Cargo.toml", "Rust"),
-        ("index.html", "static"),
+    for (path, language, is_manifest) in [
+        ("requirements.txt", "Python", true),
+        ("pyproject.toml", "Python", true),
+        ("go.mod", "Go", true),
+        ("Cargo.toml", "Rust", true),
+        ("index.html", "static", false),
     ] {
-        if github_file_text(state, repo, branch, path, token)
-            .await?
-            .is_some()
-        {
-            return Ok(railpack_inspection(repo, branch, default_branch, language));
+        if let Some(contents) = github_file_text(state, repo, branch, path, token).await? {
+            let base = railpack_inspection(repo, branch, default_branch, language);
+            let mut detected = if is_manifest {
+                infer_service_addons(&manifest_dependency_tokens(&contents))
+            } else {
+                DetectedServices::default()
+            };
+            detected.merge(&compose_addons);
+            return Ok(apply_data_mount_path(
+                with_detected_services(base, &detected),
+                data_mount_path.as_deref(),
+            ));
         }
     }
 
     Ok(unknown_inspection(repo, branch, default_branch))
+}
+
+/// Applies a detected data mount path to an inspection (no-op when none/invalid),
+/// so the single-service managed volume mounts where the app declares it persists.
+fn apply_data_mount_path(inspection: Value, path: Option<&str>) -> Value {
+    match path {
+        Some(path) => with_data_mount_path(inspection, path),
+        None => inspection,
+    }
+}
+
+/// Reads a repo's bare docker-compose file (one without a `hostlet.yml`) for two
+/// single-service signals: the managed backing add-ons its service images map to,
+/// and the container path it declares for persistent data (`./data:/app/data` →
+/// `/app/data`). The repo's compose is never run on a shared host — only these
+/// signals inform the generated stack + where the managed data volume mounts.
+async fn detect_compose_signals(
+    state: &AppState,
+    repo: &str,
+    branch: &str,
+    token: Option<&str>,
+) -> anyhow::Result<(DetectedServices, Option<String>)> {
+    for path in ["compose.yaml", "docker-compose.yml"] {
+        if let Some(compose_text) = github_file_text(state, repo, branch, path, token).await? {
+            return Ok((
+                infer_addons_from_compose(&compose_text),
+                detect_data_mount_path(&compose_text),
+            ));
+        }
+    }
+    Ok((DetectedServices::default(), None))
 }
 
 async fn github_file_text(

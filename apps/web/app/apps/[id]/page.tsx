@@ -35,7 +35,9 @@ import {
   Panel,
   SectionHeader,
   SelectField,
+  ServiceStack,
   StatusPill,
+  StorageMeter,
   SummaryItem,
   ToggleCard,
 } from "@/components/ui";
@@ -207,6 +209,8 @@ export default function AppDetail({ params }: { params: Promise<{ id: string }> 
 
           <WebhookNotice autoDeployEnabled={!!app?.autoDeploy} onManualDeploy={deploy} deployDisabled={!!busyAction || active} className="mb-6" />
 
+          {app?.runtimeKind === "compose" && <ServiceStack services={app?.services} />}
+
           <Panel className="mb-6">
             <SectionHeader title="App actions" description="Deploy, operate, publish, and remove this self-hosted app." />
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -328,6 +332,14 @@ export default function AppDetail({ params }: { params: Promise<{ id: string }> 
                   </MetricsGrid>
                 ) : (
                   <Notice tone="neutral" description={resourceMessage} />
+                )}
+                {typeof app?.storageLimitBytes === "number" && app.storageLimitBytes > 0 && (
+                  <StorageMeter
+                    className="mt-3"
+                    label="Managed storage"
+                    usedBytes={app.storageUsedBytes}
+                    limitBytes={app.storageLimitBytes}
+                  />
                 )}
               </section>
 

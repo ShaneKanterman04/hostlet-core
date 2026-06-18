@@ -8,6 +8,7 @@ mod resource_stats;
 mod screenshot_tests;
 #[cfg(test)]
 mod status_tests;
+mod storage_stats;
 
 use capture_url::validate_capture_url;
 pub(crate) use health::CONTAINER_STATE_INSPECT_FORMAT;
@@ -18,7 +19,8 @@ use health::{
 use reconcile::{
     container_actual_from_state, decide_reconcile, ContainerActual, ReconcileDecision,
 };
-pub(crate) use resource_stats::publish_resource_stats;
+pub(crate) use resource_stats::{parse_docker_bytes, publish_resource_stats};
+pub(crate) use storage_stats::publish_storage_stats;
 
 pub(crate) async fn write_route_file(target: &Path, contents: &str) -> anyhow::Result<()> {
     let tmp = target.with_extension(format!("caddy.tmp-{}", std::process::id()));
@@ -133,6 +135,9 @@ pub(crate) struct StatusDetails<'a> {
     pub(crate) published_port: Option<u16>,
     pub(crate) compose_project: Option<&'a str>,
     pub(crate) runtime_metadata: Option<Value>,
+    /// Per-service rows for a multi-service (Compose) deployment, serialized
+    /// from `[DeploymentServiceReport]`. Only populated on the success path.
+    pub(crate) services: Option<Value>,
 }
 
 pub(crate) async fn status_extra(cfg: &Config, id: Uuid, status: &str, details: StatusDetails<'_>) {
@@ -151,6 +156,7 @@ fn deployment_status_event(id: Uuid, status: &str, details: StatusDetails<'_>) -
         "published_port": details.published_port,
         "compose_project": details.compose_project,
         "runtime_metadata": details.runtime_metadata,
+        "services": details.services,
     })
 }
 

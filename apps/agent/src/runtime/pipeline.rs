@@ -75,6 +75,31 @@ pub(crate) async fn deploy(cfg: Config, p: Value) -> anyhow::Result<()> {
     let image = format!("hostlet/{app_name}:{deployment_id}");
     let project_dir = safe_project_dir(&checkout, root_directory).await?;
     if p.get("runtime_kind").and_then(|v| v.as_str()) == Some("compose") {
+        // Managed-add-ons stacks set the web service to `image:
+        // ${HOSTLET_WEB_IMAGE}`, so the repo is built with the normal pipeline
+        // and the resulting image is interpolated into compose. Bring-your-own
+        // compose (no marker) builds its own services and skips this.
+        let web_image_marker = format!("${{{}}}", hostlet_contracts::compose::WEB_IMAGE_ENV);
+        let needs_web_build = p
+            .pointer("/runtime_config/generatedCompose/compose")
+            .and_then(|value| value.as_str())
+            .is_some_and(|compose| compose.contains(&web_image_marker));
+        let web_image = if needs_web_build {
+            build_image(
+                &cfg,
+                deployment_id,
+                &app_name,
+                &image,
+                &project_dir,
+                port,
+                &p,
+                git_sync_duration_ms,
+            )
+            .await?;
+            Some(image.clone())
+        } else {
+            None
+        };
         return deploy_compose(
             cfg,
             p.clone(),
@@ -87,6 +112,7 @@ pub(crate) async fn deploy(cfg: Config, p: Value) -> anyhow::Result<()> {
             domain,
             health_path,
             git_sync_duration_ms,
+            web_image.as_deref(),
         )
         .await;
     }
@@ -496,7 +522,11 @@ async fn run_app_container(
     let port_map = docker_port_map(port as u16);
     let data_volume = app_data_volume(app_id);
     ensure_app_data_volume(cfg, deployment_id, &data_volume).await?;
-    let data_mount = format!("type=volume,source={data_volume},target=/data");
+    // Mount the managed volume where the app declares it persists data (e.g.
+    // /app/data) instead of the default /data, so apps that aren't run as compose
+    // on Cloud still persist + report storage. Falls back to /data.
+    let data_mount_target = data_mount_path(p);
+    let data_mount = format!("type=volume,source={data_volume},target={data_mount_target}");
     let mut args = vec![
         "run",
         "-d",

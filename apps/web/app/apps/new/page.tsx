@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, Box, CheckCircle2, GitBranch, HardDrive, Lock, Plus, Search, Server, WandSparkles } from "lucide-react";
 import { api } from "@/lib/api";
-import { AppShell, DataList, Field, Notice, PageHeader, Panel, SectionHeader, SelectField, StatusPill, SummaryItem, ToggleCard, cx } from "@/components/ui";
+import { AppShell, Badge, DataList, Field, Notice, PageHeader, Panel, SectionHeader, SelectField, StatusPill, SummaryItem, ToggleCard, cx } from "@/components/ui";
 import { WebhookNotice } from "@/components/WebhookNotice";
 import {
   CreateAppForm,
@@ -133,6 +133,9 @@ export default function CreateApp() {
         env,
         deploy_after_create: !!inspection?.deployable,
       };
+      // Managed services are auto-detected during inspection and ride along in
+      // `form.runtime_config` (runtimeKind "compose" + compose.addOns), which the
+      // backend resolves into a generated multi-service runtime — no manual picking.
       const res = await api<{ id: string; deploymentId?: string | null }>("/api/apps", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -221,6 +224,20 @@ export default function CreateApp() {
                         <SummaryItem label="Package manager" value={inspection.packageManager || "n/a"} />
                       </div>
                     )}
+                    {inspection.runtimeKind === "compose" && inspection.services && inspection.services.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        <div className="eyebrow">Detected services</div>
+                        {inspection.services.map((service) => (
+                          <div key={service.name} className="flex items-center justify-between gap-2 rounded-md border border-line bg-surface px-3 py-2 text-sm">
+                            <span className="flex min-w-0 items-center gap-2">
+                              <span className="truncate font-medium">{service.name}</span>
+                              <Badge variant={service.role === "web" ? "neutral" : "outline"}>{service.role === "web" ? "web" : "internal"}</Badge>
+                            </span>
+                            <span className="muted truncate text-xs">{service.image || (service.build ? "build from repo" : "")}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     {inspection.warnings.length > 0 && (
                       <div className="mt-3 space-y-2">
                         {inspection.warnings.map((warning) => (
@@ -280,6 +297,7 @@ export default function CreateApp() {
                   <SummaryItem label="Machine" value={selectedServer ? `${selectedServer.name} · local · ${selectedServer.status}` : "This machine"} />
                   <SummaryItem label="Route" value={routePreview} />
                   <SummaryItem label="Build" value={inspection?.deployable ? "Auto generated" : "Inspect repo"} />
+                  <SummaryItem label="Storage" value="5 GB managed volume · soft limit" />
                   <SummaryItem label="Automation" value={`${form.auto_deploy ? "Auto deploy" : "Manual deploy"} · ${form.public_exposure ? "public" : "private"}`} />
                 </DataList>
                 <button className="button mt-4 w-full" disabled={creating || !canCreate} onClick={submit}>

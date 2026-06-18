@@ -1,3 +1,7 @@
+import type { ServiceSummary } from "@/components/ui/service-card";
+
+export type { ServiceSummary };
+
 export type ResourceStats = {
   cpuPercent: string;
   cpuPercentValue?: number | null;
@@ -84,6 +88,7 @@ export type App = {
   containerPort?: number | null;
   healthPath?: string | null;
   runtimeKind?: string | null;
+  services?: ServiceSummary[] | null;
   hostletConfigPath?: string | null;
   packagingStrategy?: string | null;
   rootDirectory?: string | null;
@@ -92,6 +97,8 @@ export type App = {
   startCommand?: string | null;
   memoryLimitMb?: number | null;
   cpuLimit?: number | null;
+  storageUsedBytes?: number | null;
+  storageLimitBytes?: number | null;
   currentDeploymentId?: string | null;
   publicExposure?: boolean | null;
   autoDeploy?: boolean | null;

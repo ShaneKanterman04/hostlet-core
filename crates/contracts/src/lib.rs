@@ -3,13 +3,16 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+pub mod compose;
 pub mod crypto;
 mod inference;
 
 pub use inference::{
-    dockerfile_inspection, gitea_inspection, infer_dockerfile, infer_package_json,
-    infer_package_manager, node_inspection, railpack_inspection, unknown_inspection,
-    DockerfileInference, PackageInference,
+    compose_inspection, dockerfile_inspection, gitea_inspection, infer_addons_from_compose,
+    infer_dockerfile, infer_package_json, infer_package_manager, infer_service_addons,
+    manifest_dependency_tokens, node_inspection, package_json_dependencies, railpack_inspection,
+    unknown_inspection, with_detected_services, DetectedServices, DockerfileInference,
+    PackageInference,
 };
 
 /// Defines a `snake_case` status enum whose wire string is shared by serde, the
@@ -472,6 +475,63 @@ VOLUME ["/data"]
         );
         assert_eq!(value["recommendedPackagingStrategy"], "generated");
     }
+
+    #[test]
+    fn compose_inspection_emits_service_list_and_compose_runtime() {
+        let services = compose::parse_compose_services(
+            "services:\n  web:\n    build: .\n  redis:\n    image: redis:7-alpine\n",
+            "web",
+        );
+        let compose = compose::HostletComposeSection {
+            web_service: "web".to_string(),
+            file: None,
+            port: Some(3000),
+            health_path: Some("/healthz".to_string()),
+        };
+        let value = compose_inspection(
+            "owner/stack",
+            "main",
+            "main",
+            "hostlet.yml",
+            &compose,
+            &services,
+            &[],
+        );
+
+        assert_eq!(value["runtimeKind"], "compose");
+        assert_eq!(value["webService"], "web");
+        assert_eq!(value["deployable"], true);
+        assert_eq!(value["healthPath"], "/healthz");
+        assert_eq!(value["services"].as_array().unwrap().len(), 2);
+        assert_eq!(value["services"][0]["role"], "web");
+    }
+
+    #[test]
+    fn compose_inspection_with_subset_violation_is_not_deployable() {
+        let services = compose::parse_compose_services("services:\n  web:\n    build: .\n", "web");
+        let compose = compose::HostletComposeSection {
+            web_service: "web".to_string(),
+            file: None,
+            port: None,
+            health_path: None,
+        };
+        let value = compose_inspection(
+            "owner/stack",
+            "main",
+            "main",
+            "hostlet.yml",
+            &compose,
+            &services,
+            &["Service web uses unsupported field ports".to_string()],
+        );
+
+        assert_eq!(value["deployable"], false);
+        assert!(value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("ports")));
+    }
 }
 
 string_status_enum! {
@@ -629,7 +689,13 @@ pub enum AgentEvent {
     ResourceStats(ResourceStatsEvent),
     HealthStatus(HealthStatusEvent),
     JobStatus(JobStatusEvent),
+    StorageStats(StorageStatsEvent),
 }
+
+/// The self-hosted default per-app managed-volume storage limit (MB). Hostlet
+/// Cloud overrides this per plan via `runtime_config.compose.volumeStorageLimitMb`;
+/// self-hosted apps fall back to this. Env-overridable by the API.
+pub const DEFAULT_VOLUME_STORAGE_LIMIT_MB: i64 = 5120;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct DeploymentStatusEvent {
@@ -642,6 +708,53 @@ pub struct DeploymentStatusEvent {
     pub published_port: Option<i32>,
     pub compose_project: Option<String>,
     pub runtime_metadata: Option<Value>,
+    /// Per-service rows for a multi-service (Compose) deployment. Absent/empty
+    /// for single-service apps. `#[serde(default)]` keeps the wire shape
+    /// backward compatible with agents that predate multi-service reporting.
+    #[serde(default)]
+    pub services: Vec<DeploymentServiceReport>,
+}
+
+/// One Compose service as reported by the agent after `docker compose up`. The
+/// API persists these into `deployment_services` and serves them back so the UI
+/// can render a card per service.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentServiceReport {
+    pub name: String,
+    /// `"web"` for the routed entrypoint, `"backing"` for internal dependencies.
+    pub role: String,
+    pub container_name: Option<String>,
+    pub image_tag: Option<String>,
+    pub target_port: Option<i32>,
+    pub published_port: Option<i32>,
+    /// Container lifecycle state (e.g. `running`, `exited`).
+    pub status: Option<String>,
+    /// HTTP health classification; only meaningful for the web service.
+    pub health_status: Option<String>,
+}
+
+/// One managed volume's measured disk usage, reported by the agent for the
+/// per-service storage breakdown. `name` is the logical compose volume name
+/// (e.g. `pgdata`) or the single-service data volume.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeUsage {
+    pub name: String,
+    pub used_bytes: i64,
+}
+
+/// Per-app managed-volume storage usage, sampled periodically by the agent
+/// (`docker system df -v`) and persisted by the API for the quota meter + the
+/// deploy gate. `used_bytes` is the combined size of all the app's managed
+/// volumes (the web/data volume plus each add-on volume).
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatsEvent {
+    pub app_id: Uuid,
+    pub used_bytes: i64,
+    #[serde(default)]
+    pub volumes: Vec<VolumeUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -740,6 +853,25 @@ mod tests {
         let event = AgentEvent::Heartbeat;
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "heartbeat");
+    }
+
+    #[test]
+    fn storage_stats_event_uses_camelcase_and_round_trips() {
+        let event = AgentEvent::StorageStats(StorageStatsEvent {
+            app_id: Uuid::from_u128(1),
+            used_bytes: 1_572_864,
+            volumes: vec![VolumeUsage {
+                name: "pgdata".into(),
+                used_bytes: 1_048_576,
+            }],
+        });
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "storage_stats");
+        assert_eq!(value["appId"], Uuid::from_u128(1).to_string());
+        assert_eq!(value["usedBytes"], 1_572_864);
+        assert_eq!(value["volumes"][0]["name"], "pgdata");
+        assert_eq!(value["volumes"][0]["usedBytes"], 1_048_576);
+        assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
     }
 
     #[test]
