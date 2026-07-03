@@ -1,9 +1,11 @@
-name: CI
+name: PR Homelab CI
 
 on:
-  push:
-    branches:
-      - main
+  pull_request_target:
+    types:
+      - labeled
+      - synchronize
+      - reopened
 
 permissions:
   contents: read
@@ -12,42 +14,55 @@ env:
   HOSTLET_ALLOWED_RUNNER_NAMES: hostlet-core-homelab-2,hostlet-core-homelab-3
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: pr-homelab-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
+  clear-approval:
+    if: github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'homelab-ci-approved')
+    runs-on: [self-hosted, Linux, X64, hostlet-core]
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove stale homelab CI approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.pull_request.number }}
+        run: |
+          curl -fsS -X DELETE \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/issues/${ISSUE}/labels/homelab-ci-approved"
+
   secrets:
+    if: github.event.action == 'labeled' && github.event.label.name == 'homelab-ci-approved'
     runs-on: [self-hosted, Linux, X64, hostlet-core]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
           fetch-depth: 0
       - run: scripts/ci-verify-runner.sh
       - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f detect --source=/repo --redact --verbose
 
   rust:
+    if: github.event.action == 'labeled' && github.event.label.name == 'homelab-ci-approved'
     runs-on: [self-hosted, Linux, X64, hostlet-core]
     env:
-      # Cap cargo parallelism: several workflows from both repos land on one
-      # 4-vCPU/23Gi homelab VM; uncapped workspace builds stacking up OOM'd the
-      # hypervisor and hard-reset the box (2026-06-10 crash-loop incident).
       CARGO_BUILD_JOBS: "2"
     steps:
-      - uses: actions/checkout@v4
-      - run: scripts/ci-verify-runner.sh
-      # Put the runner's pre-installed rustup on PATH so dtolnay/rust-toolchain
-      # reuses the cached toolchain instead of re-bootstrapping it via
-      # `curl sh.rustup.rs` (slow + flaky) on every job.
-      - name: Use runner's cached rustup
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          # rustup minimal profile (dtolnay default) drops these when it
-          # refreshes stable; pin them so cargo fmt/clippy stay available.
-          components: rustfmt, clippy
-      # Compilation is cached locally by sccache (RUSTC_WRAPPER set in the
-      # self-hosted runner .env), so target/ is no longer round-tripped to the
-      # GitHub Actions cache backend over the network. Replaces Swatinem/rust-cache@v2.
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - run: scripts/ci-verify-runner.sh
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - run: scripts/check-line-cap.sh
       - run: scripts/check-line-cap-selftest.sh
       - run: scripts/check-migration-versions.sh
@@ -58,12 +73,17 @@ jobs:
       - run: cargo test --workspace
 
   web:
+    if: github.event.action == 'labeled' && github.event.label.name == 'homelab-ci-approved'
     runs-on: [self-hosted, Linux, X64, hostlet-core]
     defaults:
       run:
         working-directory: apps/web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
       - run: ../../scripts/ci-verify-runner.sh
       - run: node --version && pnpm --version
       - run: pnpm install --frozen-lockfile
@@ -76,6 +96,7 @@ jobs:
       - run: ../../scripts/ci-security-artifact-smoke.sh
 
   compose:
+    if: github.event.action == 'labeled' && github.event.label.name == 'homelab-ci-approved'
     runs-on: [self-hosted, Linux, X64, hostlet-core]
     env:
       POSTGRES_PASSWORD: ci-only-not-a-secret-postgres
@@ -95,15 +116,24 @@ jobs:
       HOSTLET_SCREENSHOTTER_IMAGE: ghcr.io/shanekanterman04/hostlet-screenshotter@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       DOCKER_GID: "998"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
       - run: scripts/ci-verify-runner.sh
       - run: docker compose -f infra/docker-compose.yml config >/dev/null
       - run: docker compose -f infra/docker-compose.prod.yml config >/dev/null
 
   docker:
+    if: github.event.action == 'labeled' && github.event.label.name == 'homelab-ci-approved'
     runs-on: [self-hosted, Linux, X64, hostlet-core]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
       - run: scripts/ci-verify-runner.sh
       - run: scripts/ci-docker-retry.sh docker build -f apps/web/Dockerfile -t hostlet-web-ci .
       - run: scripts/ci-docker-retry.sh docker build -f apps/api/Dockerfile -t hostlet-api-ci .
