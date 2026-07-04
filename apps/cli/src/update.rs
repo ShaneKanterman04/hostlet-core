@@ -147,7 +147,7 @@ pub(crate) async fn update(
     let tmp_binary = download_verified_cli(&client, &release, &tmp_dir).await?;
 
     checkout_release_tag(root, &release)?;
-    update_env_image_tag(root, &release.image_tag())?;
+    update_env_release_images(root, &release)?;
     let previous = swap_cli_binary(&tmp_dir, &tmp_binary)?;
 
     compose_up(root, false, false)?;
@@ -254,14 +254,20 @@ pub(crate) fn update_preflight(root: &Path, release: &ReleaseInfo) -> anyhow::Re
     if !release.has_release_images() {
         bail!("latest release is missing required Hostlet image metadata");
     }
+    if !release.has_release_image_digests() {
+        bail!("latest release is missing required Hostlet image digests");
+    }
     Ok(())
 }
 
-pub(crate) fn update_env_image_tag(root: &Path, image_tag: &str) -> anyhow::Result<()> {
+pub(crate) fn update_env_release_images(root: &Path, release: &ReleaseInfo) -> anyhow::Result<()> {
     let env_path = root.join(".env");
     let mut env = read_env_file(&env_path)
         .with_context(|| format!("failed to read {}", env_path.display()))?;
-    env.insert("HOSTLET_IMAGE_TAG".into(), image_tag.to_string());
+    for (key, value) in release.image_env()? {
+        env.insert(key, value);
+    }
+    env.insert("HOSTLET_IMAGE_TAG".into(), release.image_tag());
     write_env_file(&env_path, &env)
 }
 
@@ -276,4 +282,58 @@ pub(crate) fn checkout_release_tag(root: &Path, release: &ReleaseInfo) -> anyhow
         &["fetch".into(), "--tags".into(), "--force".into()],
     )?;
     run_passthrough(root, "git", &["checkout".into(), "--detach".into(), tag])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn operator_api_and_token_prefers_public_api_url_and_trims_slashes() {
+        let env = env_map(&[
+            ("PUBLIC_API_URL", "https://hostlet.example.test/"),
+            ("HOSTLET_API_URL", "http://ignored.test"),
+            ("LOCAL_AGENT_TOKEN", "tok-123"),
+        ]);
+
+        let (api_url, token) = operator_api_and_token(&env).unwrap();
+
+        assert_eq!(api_url, "https://hostlet.example.test");
+        assert_eq!(token, "tok-123");
+    }
+
+    #[test]
+    fn operator_api_and_token_falls_back_to_hostlet_api_url() {
+        let env = env_map(&[
+            ("HOSTLET_API_URL", "http://10.0.0.1:8080///"),
+            ("LOCAL_AGENT_TOKEN", "tok"),
+        ]);
+
+        let (api_url, _) = operator_api_and_token(&env).unwrap();
+
+        assert_eq!(api_url, "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn operator_api_and_token_defaults_to_loopback_when_unset() {
+        let env = env_map(&[("LOCAL_AGENT_TOKEN", "tok")]);
+
+        let (api_url, _) = operator_api_and_token(&env).unwrap();
+
+        assert_eq!(api_url, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn operator_api_and_token_requires_local_agent_token() {
+        let env = env_map(&[("PUBLIC_API_URL", "https://hostlet.example.test")]);
+
+        assert!(operator_api_and_token(&env).is_err());
+    }
 }

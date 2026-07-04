@@ -390,6 +390,60 @@ mod tests {
     }
 
     #[test]
+    fn quote_env_leaves_url_safe_values_unquoted() {
+        // Alphanumerics plus / : . _ - , = stay bare (see quote_env's allow list).
+        let value = "ghcr.io/shanekanterman04/hostlet-api:v0.4.1";
+        assert_eq!(quote_env(value), value);
+    }
+
+    #[test]
+    fn quote_env_quotes_and_escapes_special_characters() {
+        assert_eq!(quote_env("a b"), "\"a b\"");
+        assert_eq!(quote_env("he said \"hi\""), "\"he said \\\"hi\\\"\"");
+        assert_eq!(quote_env("back\\slash"), "\"back\\\\slash\"");
+    }
+
+    #[test]
+    fn quote_env_and_unquote_env_treat_empty_as_empty() {
+        assert_eq!(quote_env(""), "");
+        assert_eq!(unquote_env(""), "");
+    }
+
+    #[test]
+    fn env_quote_round_trips_quotes_and_backslashes() {
+        for value in [
+            "a b",
+            "he said \"hi\"",
+            "back\\slash",
+            "trailing\\",
+            "\\\"mixed\\\"",
+        ] {
+            assert_eq!(
+                unquote_env(&quote_env(value)),
+                value,
+                "round trip failed for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_duration_reports_minutes_below_one_hour() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0 minutes");
+        assert_eq!(format_duration(Duration::from_secs(59)), "0 minutes");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1 minutes");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59 minutes");
+    }
+
+    #[test]
+    fn format_duration_reports_hours_then_days_at_boundaries() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1 hours");
+        assert_eq!(format_duration(Duration::from_secs(47 * 3600)), "47 hours");
+        // 48 h is the days threshold: hours/24 = 2.
+        assert_eq!(format_duration(Duration::from_secs(48 * 3600)), "2 days");
+        assert_eq!(format_duration(Duration::from_secs(72 * 3600)), "3 days");
+    }
+
+    #[test]
     fn generated_encryption_key_is_base64_32_bytes() {
         let secret = base64_secret(32);
         assert_eq!(STANDARD.decode(secret).unwrap().len(), 32);
@@ -397,6 +451,7 @@ mod tests {
 
     #[test]
     fn release_manifest_parses_image_metadata() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let manifest = serde_json::json!({
             "version": "v0.4.1",
             "image_registry": "ghcr.io/shanekanterman04",
@@ -404,19 +459,19 @@ mod tests {
             "images": {
                 "api": {
                     "ref": "ghcr.io/shanekanterman04/hostlet-api:v0.4.1",
-                    "digest": "sha256:api"
+                    "digest": digest
                 },
                 "web": {
                     "ref": "ghcr.io/shanekanterman04/hostlet-web:v0.4.1",
-                    "digest": "sha256:web"
+                    "digest": digest
                 },
                 "agent": {
                     "ref": "ghcr.io/shanekanterman04/hostlet-agent:v0.4.1",
-                    "digest": "sha256:agent"
+                    "digest": digest
                 },
                 "screenshotter": {
                     "ref": "ghcr.io/shanekanterman04/hostlet-screenshotter:v0.4.1",
-                    "digest": "sha256:screenshotter"
+                    "digest": digest
                 }
             }
         });
@@ -433,7 +488,7 @@ mod tests {
         );
         assert_eq!(
             release.images.agent.as_ref().unwrap().digest.as_deref(),
-            Some("sha256:agent")
+            Some(digest)
         );
         assert_eq!(
             release
@@ -443,8 +498,9 @@ mod tests {
                 .unwrap()
                 .digest
                 .as_deref(),
-            Some("sha256:screenshotter")
+            Some(digest)
         );
+        assert!(release.has_release_image_digests());
     }
 
     #[test]
@@ -457,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn update_env_image_tag_rewrites_existing_env_file() {
+    fn update_env_release_images_rewrites_existing_env_file() {
         let root = std::env::temp_dir().join(format!("hostlet-cli-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -468,12 +524,38 @@ mod tests {
         )
         .unwrap();
 
-        update_env_image_tag(&root, "v0.4.1").unwrap();
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut release = test_release();
+        release.image_tag = Some("v0.4.1".into());
+        release.images = ReleaseImages {
+            api: Some(ReleaseImage {
+                reference: "ghcr.io/example/hostlet-api:v0.4.1".into(),
+                digest: Some(digest.into()),
+            }),
+            web: Some(ReleaseImage {
+                reference: "ghcr.io/example/hostlet-web:v0.4.1".into(),
+                digest: Some(digest.into()),
+            }),
+            agent: Some(ReleaseImage {
+                reference: "ghcr.io/example/hostlet-agent:v0.4.1".into(),
+                digest: Some(digest.into()),
+            }),
+            screenshotter: Some(ReleaseImage {
+                reference: "ghcr.io/example/hostlet-screenshotter:v0.4.1".into(),
+                digest: Some(digest.into()),
+            }),
+        };
+
+        update_env_release_images(&root, &release).unwrap();
         let env = read_env_file(&env_path).unwrap();
 
         assert_eq!(
             env.get("HOSTLET_IMAGE_TAG").map(String::as_str),
             Some("v0.4.1")
+        );
+        assert_eq!(
+            env.get("HOSTLET_API_IMAGE").map(String::as_str),
+            Some("ghcr.io/example/hostlet-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(
             env.get("POSTGRES_PASSWORD").map(String::as_str),

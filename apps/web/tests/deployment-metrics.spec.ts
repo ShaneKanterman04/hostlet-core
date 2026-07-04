@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { firstErrorLine } from "@/components/ui";
+import { statusSteps } from "@/app/deployments/[id]/deploymentStatus";
 
 const validRuntimeMetadata = {
   packagingStrategy: "generated",
@@ -86,8 +87,20 @@ test("successful deployment does not promote transient health check retries", as
   await page.goto("/deployments/deploy-1");
 
   await expect(page.getByText("First error in the log")).toHaveCount(0);
-  await expect(page.getByText("stdout: Health check attempt 1/30 did not connect: error sending request for url (http://127.0.0.1:37438/)")).toBeVisible();
-  await expect(page.getByText("stdout: Health check passed.")).toBeVisible();
+  await expect(page.getByText("Health check attempt 1/30 did not connect: error sending request for url (http://127.0.0.1:37438/)")).toBeVisible();
+  await expect(page.getByText("Health check passed.")).toBeVisible();
+});
+
+test("log viewer strips stdout/stderr prefixes from rendered lines", async ({ page }) => {
+  await mockDeploymentApi(page, validRuntimeMetadata, { status: "success" }, [
+    { stream: "stdout", line: "$ npm run build" },
+    { stream: "stderr", line: "oops" },
+  ]);
+  await page.goto("/deployments/deploy-1");
+
+  await expect(page.getByText("$ npm run build")).toBeVisible();
+  await expect(page.getByText("stdout:")).toHaveCount(0);
+  await expect(page.locator('[data-stream="stderr"]').getByText("oops")).toBeVisible();
 });
 
 test("firstErrorLine skips command echoes with error-like flags", () => {
@@ -95,6 +108,18 @@ test("firstErrorLine skips command echoes with error-like flags", () => {
     "stdout: $ railpack build --name hostlet/app-demo:image --progress plain --error-missing-start /var/lib/hostlet/repos/app-demo",
     "stderr: error: no start command could be inferred",
   ])).toBe("stderr: error: no start command could be inferred");
+});
+
+test("deployment status steps mark the terminal success step as failed", () => {
+  const steps = statusSteps("failed");
+  expect(steps.slice(0, -1).every((step) => step.done && !step.failed)).toBe(true);
+  expect(steps.at(-1)).toMatchObject({ step: "success", current: true, done: false, failed: true });
+});
+
+test("deployment status steps keep active in-progress states focused", () => {
+  const steps = statusSteps("health_checking");
+  expect(steps.find((step) => step.step === "health_checking")).toMatchObject({ current: true, done: true, failed: false });
+  expect(steps.find((step) => step.step === "routing")).toMatchObject({ current: false, done: false, failed: false });
 });
 
 async function mockDeploymentApi(

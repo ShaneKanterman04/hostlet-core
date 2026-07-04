@@ -18,7 +18,12 @@ CARGO_TARGET_DIR=/tmp/hostlet-target cargo test --workspace
 pnpm --dir apps/web lint
 pnpm --dir apps/web build
 docker compose -f infra/docker-compose.yml config
-HOSTLET_IMAGE_TAG=v0.0.0 docker compose -f infra/docker-compose.prod.yml config
+HOSTLET_IMAGE_TAG=v0.0.0 \
+HOSTLET_API_IMAGE=ghcr.io/shanekanterman04/hostlet-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+HOSTLET_WEB_IMAGE=ghcr.io/shanekanterman04/hostlet-web@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+HOSTLET_AGENT_IMAGE=ghcr.io/shanekanterman04/hostlet-agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+HOSTLET_SCREENSHOTTER_IMAGE=ghcr.io/shanekanterman04/hostlet-screenshotter@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+docker compose -f infra/docker-compose.prod.yml config
 ```
 
 Use narrower checks for small docs-only changes, but always run link and secret scans for documentation edits.
@@ -37,7 +42,7 @@ Production releases are tagged `vX.Y.Z` and publish:
 
 - CLI binary and checksum
 - `hostlet-release.json`
-- GHCR images for API, web, and agent
+- GHCR images for API, web, agent, and screenshotter
 
 ## Security Review Expectations
 

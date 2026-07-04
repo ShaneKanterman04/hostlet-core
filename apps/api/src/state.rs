@@ -1,6 +1,8 @@
-use crate::crypto::{hash_token, nonempty_env, Crypto};
+use crate::crypto::{hash_token, Crypto};
 use crate::deployment_policy::{DeploymentStatusPolicy, NoopDeploymentStatusPolicy};
-use crate::env::{bool_env, http_client, screenshot_dir, secret_from_env};
+use crate::env::{bool_env, http_client, nonempty_env, screenshot_dir, secret_from_env};
+use crate::health_alerts::{HealthEventHooks, NoopHealthEventHooks};
+use crate::policies::{RepositoryAccessProvider, SelfHostedRepositoryAccessProvider};
 use crate::rate_limit::RateLimiter;
 use crate::screenshots::{NoopScreenshotHooks, ScreenshotHooks};
 use anyhow::{bail, Context};
@@ -58,6 +60,7 @@ pub struct AppState {
     pub screenshot_dir: PathBuf,
     pub screenshot_hooks: Arc<dyn ScreenshotHooks>,
     pub deployment_status_policy: Arc<dyn DeploymentStatusPolicy>,
+    pub repo_access_provider: Arc<dyn RepositoryAccessProvider>,
     pub allowed_web_origins: Vec<String>,
     pub base_domain: Option<String>,
     pub domain_prefix: String,
@@ -69,6 +72,7 @@ pub struct AppState {
     pub setup_token: Option<String>,
     pub allowed_github_logins: Option<HashSet<String>>,
     pub update_checks_enabled: bool,
+    pub health_event_hooks: Arc<dyn HealthEventHooks>,
     pub agents: Arc<RwLock<HashMap<Uuid, AgentConnection>>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub logs: broadcast::Sender<LogEvent>,
@@ -149,6 +153,7 @@ impl AppState {
             screenshot_dir,
             screenshot_hooks: Arc::new(NoopScreenshotHooks),
             deployment_status_policy: Arc::new(NoopDeploymentStatusPolicy),
+            repo_access_provider: Arc::new(SelfHostedRepositoryAccessProvider),
             allowed_web_origins,
             base_domain: base_domain(),
             domain_prefix: domain_prefix(),
@@ -160,6 +165,7 @@ impl AppState {
             setup_token,
             allowed_github_logins,
             update_checks_enabled: update_checks_enabled(),
+            health_event_hooks: Arc::new(NoopHealthEventHooks),
             agents: Arc::new(RwLock::new(HashMap::new())),
             rate_limiter: Arc::new(RateLimiter::default()),
             logs,
@@ -178,6 +184,12 @@ impl AppState {
         policy: Arc<dyn DeploymentStatusPolicy>,
     ) -> Self {
         self.deployment_status_policy = policy;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_health_event_hooks(mut self, hooks: Arc<dyn HealthEventHooks>) -> Self {
+        self.health_event_hooks = hooks;
         self
     }
 }
@@ -310,22 +322,30 @@ pub async fn db_test_state_from_env() -> Option<AppState> {
     set_test_env_default("PUBLIC_WEBHOOK_URL", "http://127.0.0.1:18080");
     set_test_env_default("HOSTLET_ALLOWED_WEB_ORIGINS", "http://127.0.0.1:3000");
     set_test_env_default("HOSTLET_ALLOW_INSECURE_DEV_DEFAULTS", "false");
-    set_test_env_default("HOSTLET_SETUP_TOKEN", "ci-only-not-a-secret-setup-token-01");
+    set_test_env_default("HOSTLET_SETUP_TOKEN", &ci_test_secret_value("setup-token"));
     set_test_env_default("HOSTLET_ALLOWED_GITHUB_LOGINS", "ci-user");
     set_test_env_default(
         "ENCRYPTION_KEY",
         "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
     );
-    set_test_env_default("JOB_SIGNING_SECRET", "ci-only-not-a-secret-job-signing-01");
-    set_test_env_default("SESSION_SECRET", "ci-only-not-a-secret-session-secret-01");
-    set_test_env_default("LOCAL_AGENT_TOKEN", "ci-only-not-a-secret-agent-token-01");
+    set_test_env_default("JOB_SIGNING_SECRET", &ci_test_secret_value("job-signing"));
+    set_test_env_default("SESSION_SECRET", &ci_test_secret_value("session-secret"));
+    set_test_env_default(
+        "LOCAL_AGENT_TOKEN",
+        &ci_test_secret_value("local-agent-token"),
+    );
     set_test_env_default(
         "GITHUB_WEBHOOK_SECRET",
-        "ci-only-not-a-secret-webhook-secret-01",
+        &ci_test_secret_value("webhook-secret"),
     );
     set_test_env_default("HOSTLET_BASE_DOMAIN", "example.test");
     set_test_env_default("HOSTLET_UPDATE_CHECKS", "false");
     AppState::from_env().await.ok()
+}
+
+#[cfg(test)]
+fn ci_test_secret_value(label: &str) -> String {
+    format!("ci-test-{label}-value-000001")
 }
 
 #[cfg(test)]

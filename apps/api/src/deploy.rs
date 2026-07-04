@@ -285,26 +285,62 @@ pub async fn create_and_send_deploy(
     .fetch_one(&state.db)
     .await?;
     let app = DeployApp::from_row(&app_row);
-    // Storage quota gate (soft): refuse to start a new deploy when the app is
-    // already over its managed-volume storage limit, using the last sampled
-    // usage. Running data is untouched — the user frees space or raises the
-    // limit. Self-hosted uses the default limit; Cloud injects a per-plan cap.
-    let used_bytes: i64 =
-        sqlx::query_scalar("SELECT used_bytes FROM app_storage_usage WHERE app_id=$1")
+    // Storage quota gate (soft): refuse to start a new deploy when storage is
+    // already over the limit, using the last sampled usage. Usage counts the
+    // built image plus the managed volume(s); the ephemeral container writable
+    // layer does not. Running data is untouched — the user frees space, shrinks
+    // the image, or raises the limit.
+    //
+    // When the app declares an account-wide cap (Hostlet Cloud injects one per
+    // plan), the limit is the owner's *total* footprint across all their apps and
+    // supersedes the per-app limit, so storage is one shared quota rather than a
+    // separate cap per app. Self-hosted apps declare none and keep the per-app
+    // (default) limit.
+    match crate::storage::account_storage_limit_bytes(&app.runtime_config) {
+        Some(account_limit) => {
+            let used_bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(su.used_bytes + su.image_bytes), 0)::bigint \
+                 FROM app_storage_usage su JOIN apps a ON a.id = su.app_id \
+                 WHERE a.user_id = (SELECT user_id FROM apps WHERE id = $1)",
+            )
+            .bind(app_id)
+            .fetch_one(&state.db)
+            .await?;
+            if let Some(msg) =
+                storage_over_quota_error(used_bytes, account_limit, StorageScope::Account)
+            {
+                anyhow::bail!("{msg}");
+            }
+        }
+        None => {
+            let usage = sqlx::query(
+                "SELECT used_bytes, image_bytes FROM app_storage_usage WHERE app_id=$1",
+            )
             .bind(app_id)
             .fetch_optional(&state.db)
-            .await?
-            .unwrap_or(0);
-    let limit_bytes = crate::storage::volume_storage_limit_bytes(&app.runtime_config);
-    if used_bytes >= limit_bytes {
-        anyhow::bail!(
-            "This app is over its {} MB managed-storage limit ({} MB used). Free space in its \
-             volumes or raise the limit before deploying.",
-            limit_bytes / (1024 * 1024),
-            used_bytes / (1024 * 1024),
-        );
+            .await?;
+            let used_bytes = usage
+                .map(|row| {
+                    row.get::<i64, _>("used_bytes")
+                        .saturating_add(row.get::<i64, _>("image_bytes"))
+                })
+                .unwrap_or(0);
+            let limit_bytes = crate::storage::volume_storage_limit_bytes(&app.runtime_config);
+            if let Some(msg) =
+                storage_over_quota_error(used_bytes, limit_bytes, StorageScope::PerApp)
+            {
+                anyhow::bail!("{msg}");
+            }
+        }
     }
     let server_id = app.server_id;
+    // Re-check the assigned server's capacity before enqueuing. `select_app_runner`
+    // reserves a slot at app-create time by counting *live* apps, but an app
+    // created before its first deploy counts toward no server there, so several
+    // apps can be placed on a server with room for one. Enforce the real cap here.
+    // This closes the create-many-then-deploy gap; see `ensure_server_has_capacity`
+    // for the residual truly-concurrent-deploy race and why it is bounded/low-risk.
+    crate::server_capacity::ensure_server_has_capacity(state, server_id, app_id).await?;
     let insert_deployment = sqlx::query(
         "INSERT INTO deployments (app_id,server_id,status,commit_sha,started_at,runtime_kind) \
          VALUES ($1,$2,'queued',$3,now(),$4) RETURNING id",
@@ -339,7 +375,15 @@ pub async fn create_and_send_deploy(
                     .decrypt(row.get::<String, _>("value_ciphertext").as_str())?),
             );
         }
-        let github_token = github_access_token(state, user_id).await.ok().flatten();
+        // Deploy-clone credential comes from the active RepositoryAccessProvider:
+        // self-hosted uses the user's OAuth token; cloud mints a GitHub App
+        // installation token scoped to this repo. A provider error (e.g. cloud
+        // App not installed for the repo) fails the deploy with an actionable
+        // message rather than silently cloning unauthenticated.
+        let github_token = state
+            .repo_access_provider
+            .token_for_deploy(state, user_id, &app.repo_full_name)
+            .await?;
         let payload = app.deploy_payload(
             deployment_id,
             app_id,
@@ -533,6 +577,11 @@ async fn record_audit_event(
     .await;
 }
 
+/// The stored priority is `priority` plus the app's `queue_priority_offset`
+/// (0 for NULL/unknown apps). The offset is capped at 4 by a table CHECK and
+/// must stay below the smallest gap between base priorities passed by callers
+/// (currently 5: delete=5, deploy=10, interactive/screenshot=20, cleanup=50),
+/// so it can only reorder jobs within the same job-type band.
 pub async fn enqueue_agent_job(
     state: &AppState,
     server_id: Uuid,
@@ -545,7 +594,8 @@ pub async fn enqueue_agent_job(
     let id = sqlx::query(
         "INSERT INTO agent_jobs
            (server_id,app_id,deployment_id,job_type,status,payload_json,priority)
-         VALUES ($1,$2,$3,$4,'queued',$5,$6)
+         VALUES ($1,$2,$3,$4,'queued',$5,
+                 $6 + COALESCE((SELECT queue_priority_offset FROM apps WHERE id = $2), 0))
          RETURNING id",
     )
     .bind(server_id)
@@ -676,25 +726,6 @@ fn is_active_deploy_unique_violation(err: &sqlx::Error) -> bool {
             .contains("idx_deployments_one_active_per_app")
 }
 
-async fn github_access_token(state: &AppState, user_id: Uuid) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query(
-        "SELECT access_token_ciphertext
-         FROM github_accounts
-         WHERE user_id=$1
-         ORDER BY updated_at DESC
-         LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await?;
-    row.map(|row| {
-        state
-            .crypto
-            .decrypt(row.get::<String, _>("access_token_ciphertext").as_str())
-    })
-    .transpose()
-}
-
 #[cfg(test)]
 fn is_active_deployment_status(status: &str) -> bool {
     ACTIVE_DEPLOYMENT_STATUSES.contains(&status)
@@ -708,11 +739,48 @@ fn rollback_supported_for_runtime(runtime_kind: &str) -> bool {
     runtime_kind != "compose"
 }
 
+/// Which storage quota scope was exceeded, determining the user-facing message.
+#[derive(Debug, PartialEq)]
+enum StorageScope {
+    /// Account-wide cap: total footprint across all apps owned by the user.
+    Account,
+    /// Per-app cap: image + volumes for this one app.
+    PerApp,
+}
+
+/// Pure: returns the over-quota error message when `used_bytes >= limit_bytes`,
+/// `None` otherwise.  No I/O; extracts the decision from `create_and_send_deploy`
+/// so it can be unit-tested independently of the database.
+fn storage_over_quota_error(
+    used_bytes: i64,
+    limit_bytes: i64,
+    scope: StorageScope,
+) -> Option<String> {
+    if used_bytes < limit_bytes {
+        return None;
+    }
+    let limit_mb = limit_bytes / (1024 * 1024);
+    let used_mb = used_bytes / (1024 * 1024);
+    let msg = match scope {
+        StorageScope::Account => format!(
+            "Your projects are over the {limit_mb} MB account storage limit \
+             ({used_mb} MB used by their images + volumes). \
+             Remove a project, shrink an image, or upgrade your plan before deploying."
+        ),
+        StorageScope::PerApp => format!(
+            "This app is over its {limit_mb} MB storage limit \
+             ({used_mb} MB used by its image + volumes). \
+             Free space, shrink the image, or raise the limit before deploying."
+        ),
+    };
+    Some(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         deployment_queue_status, is_active_deployment_status, rollback_supported_for_runtime,
-        route_key,
+        route_key, storage_over_quota_error, StorageScope,
     };
     use crate::state::AppState;
     use uuid::Uuid;
@@ -749,6 +817,47 @@ mod tests {
     fn compose_rollback_is_disabled_for_release() {
         assert!(rollback_supported_for_runtime("single"));
         assert!(!rollback_supported_for_runtime("compose"));
+    }
+
+    #[test]
+    fn storage_quota_returns_none_when_under_limit() {
+        // Under-limit returns None for both scopes; used == limit - 1 is still ok.
+        let limit = 512_i64 * 1024 * 1024;
+        assert_eq!(
+            storage_over_quota_error(limit - 1, limit, StorageScope::PerApp),
+            None
+        );
+        assert_eq!(
+            storage_over_quota_error(limit - 1, limit, StorageScope::Account),
+            None
+        );
+    }
+
+    #[test]
+    fn storage_quota_per_app_error_at_or_over_limit() {
+        // used == limit triggers the gate; message mentions limit in MB and "This app".
+        let limit = 512_i64 * 1024 * 1024;
+        let msg = storage_over_quota_error(limit, limit, StorageScope::PerApp)
+            .expect("used == limit should produce an error");
+        assert!(msg.contains("512 MB"), "limit in message: {msg}");
+        assert!(msg.contains("This app"), "per-app scope in message: {msg}");
+    }
+
+    #[test]
+    fn storage_quota_account_error_over_limit() {
+        // Account-scope message mentions limit in MB and prompts plan upgrade.
+        let limit = 4096_i64 * 1024 * 1024;
+        let msg = storage_over_quota_error(limit + 1, limit, StorageScope::Account)
+            .expect("used > limit should produce an error");
+        assert!(msg.contains("4096 MB"), "limit in message: {msg}");
+        assert!(
+            msg.contains("Your projects"),
+            "account scope in message: {msg}"
+        );
+        assert!(
+            msg.contains("upgrade your plan"),
+            "upgrade hint in message: {msg}"
+        );
     }
 
     #[tokio::test]

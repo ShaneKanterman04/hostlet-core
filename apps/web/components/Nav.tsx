@@ -5,15 +5,18 @@ import { usePathname } from "next/navigation";
 import { Box, HardDrive, Home, LogOut, Settings, ScrollText, TerminalSquare, LucideIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import { cx } from "@/components/ui";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
-type NavItem = { href: string; label: string; icon: LucideIcon };
+// `tour` is the product-tour anchor rendered as data-tour on both the desktop
+// rail and mobile bar links; the tour engine picks the visible one.
+type NavItem = { href: string; label: string; icon: LucideIcon; tour: string };
 
 const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Overview", icon: Home },
-  { href: "/apps", label: "Apps", icon: Box },
-  { href: "/servers", label: "Machines", icon: HardDrive },
-  { href: "/logs", label: "Logs", icon: ScrollText },
-  { href: "/settings", label: "Settings", icon: Settings },
+  { href: "/", label: "Overview", icon: Home, tour: "nav-overview" },
+  { href: "/apps", label: "Apps", icon: Box, tour: "nav-apps" },
+  { href: "/servers", label: "Machines", icon: HardDrive, tour: "nav-servers" },
+  { href: "/logs", label: "Logs", icon: ScrollText, tour: "nav-logs" },
+  { href: "/settings", label: "Settings", icon: Settings, tour: "nav-settings" },
 ];
 
 function isActive(pathname: string, href: string) {
@@ -31,7 +34,7 @@ function NavLink({
 }) {
   const Icon = item.icon;
   return (
-    <Link href={item.href} className={className}>
+    <Link href={item.href} className={className} data-tour={item.tour}>
       <Icon size={iconSize} />
       {item.label}
     </Link>
@@ -81,6 +84,9 @@ export function Nav() {
           <div className="text-sm font-medium">Control plane</div>
           <p className="mt-1 text-sm text-neutral-400">Local-first management for your own servers.</p>
         </div>
+        <ThemeToggle
+          className="mt-3 w-full justify-start border-white/10 bg-white/5 text-neutral-100 hover:bg-white/10 focus-visible:ring-white/30"
+        />
         <button className={LOGOUT_CLASS} onClick={logout}>
           <LogOut size={16} />
           Log out
@@ -103,6 +109,12 @@ export function Nav() {
           );
         })}
       </nav>
+
+      {/* Compact floating toggle for mobile, where the rail (and its toggle) is hidden. */}
+      <ThemeToggle
+        showLabel={false}
+        className="fixed right-3 top-3 z-40 h-9 w-9 border-line bg-surface px-0 text-ink shadow-sm shadow-neutral-950/10 hover:bg-surface-alt focus-visible:ring-emerald-200 lg:hidden"
+      />
     </>
   );
 }

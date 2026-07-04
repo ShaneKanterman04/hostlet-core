@@ -1,3 +1,4 @@
+use crate::env::{looks_like_public_placeholder_secret, nonempty_env};
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
@@ -34,6 +35,9 @@ impl Crypto {
         // is a placeholder even if it happened to decode to 32 bytes.
         if !allow_insecure_dev_defaults && key.len() < 32 {
             bail!("ENCRYPTION_KEY must not be a short development value");
+        }
+        if !allow_insecure_dev_defaults && looks_like_public_placeholder_secret(&key) {
+            bail!("ENCRYPTION_KEY must not use the public example placeholder value");
         }
         Ok(crypto)
     }
@@ -93,19 +97,6 @@ pub fn random_token(len: usize) -> String {
         .take(len)
         .map(char::from)
         .collect()
-}
-
-/// Reads an environment variable, trims it, and returns `None` when it is
-/// missing or empty after trimming.
-///
-/// Defined here (a file cloud does not override) so cloud's overlay inherits a
-/// single binary-local definition; env access is binary-local policy, so this
-/// stays out of `contracts`.
-pub(crate) fn nonempty_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

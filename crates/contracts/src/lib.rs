@@ -6,13 +6,19 @@ use uuid::Uuid;
 pub mod compose;
 pub mod crypto;
 mod inference;
+mod validation;
 
 pub use inference::{
-    compose_inspection, dockerfile_inspection, gitea_inspection, infer_addons_from_compose,
-    infer_dockerfile, infer_package_json, infer_package_manager, infer_service_addons,
-    manifest_dependency_tokens, node_inspection, package_json_dependencies, railpack_inspection,
-    unknown_inspection, with_detected_services, DetectedServices, DockerfileInference,
-    PackageInference,
+    compose_inspection, detect_start_command, dockerfile_inspection, gitea_inspection,
+    infer_addons_from_compose, infer_dockerfile, infer_package_json, infer_package_manager,
+    infer_service_addons, manifest_dependency_tokens, node_inspection, package_json_dependencies,
+    railpack_inspection, unknown_inspection, with_command_suggestion, with_detected_services,
+    CommandSuggestion, DetectedServices, DockerfileInference, PackageInference, RepoCommandFiles,
+};
+pub use validation::{
+    clean_hostlet_config_path, clean_runtime_config, dangerous_host_process_env_key, domain_host,
+    valid_app_name, valid_cpu_limit, valid_host_process_env_key, valid_memory_limit,
+    validate_env_pairs,
 };
 
 /// Defines a `snake_case` status enum whose wire string is shared by serde, the
@@ -137,9 +143,8 @@ pub fn valid_hostname(value: &str) -> bool {
         })
 }
 
-/// Validates an HTTP health-check path.
-///
-/// Must be an absolute path (leading `/`), at most 256 chars, and free of
+/// Validates an HTTP health-check path. Must be an absolute path (leading `/`),
+/// at most 256 chars, and free of
 /// control characters and backslashes (which would be ambiguous or unsafe in a
 /// URL path).
 pub fn valid_health_path(value: &str) -> bool {
@@ -220,6 +225,27 @@ pub fn clean_command(value: Option<String>) -> Result<Option<String>, &'static s
         return Err("commands cannot contain newlines, NUL bytes, or more than 500 characters");
     }
     Ok(Some(value))
+}
+
+/// Validate and normalise an optional command patch from an update request.
+///
+/// The wire type for install/build/start commands on an update is
+/// `Option<Option<String>>`: the outer `None` means "leave the column
+/// untouched", an inner `None` means "clear the column", and an inner `Some`
+/// carries the new value which is validated and trimmed via [`clean_command`].
+/// The caller-visible shape (`None` / `Some(None)` / `Some(Some(_))`) is
+/// preserved so persistence can distinguish "unchanged" from "cleared".
+///
+/// Extracted from the previously private `clean_command_field` (core) and
+/// `validate_optional_command` (cloud overlay), which were byte-identical.
+pub fn clean_optional_command(
+    field: Option<Option<String>>,
+) -> Result<Option<Option<String>>, &'static str> {
+    match field {
+        Some(Some(value)) => Ok(Some(clean_command(Some(value))?)),
+        Some(None) => Ok(Some(None)),
+        None => Ok(None),
+    }
 }
 
 pub fn clean_runtime_kind(value: Option<&str>) -> Result<String, &'static str> {
@@ -344,6 +370,30 @@ mod contract_helper_tests {
         assert_eq!(app_slug("!!!"), "app");
         assert_eq!(app_slug("---"), "app");
         assert_eq!(app_slug("   "), "app");
+    }
+
+    #[test]
+    fn clean_optional_command_preserves_three_way_distinction() {
+        // Outer None → leave column untouched.
+        assert_eq!(clean_optional_command(None), Ok(None));
+
+        // Outer Some, inner None → clear the column.
+        assert_eq!(clean_optional_command(Some(None)), Ok(Some(None)));
+
+        // Outer Some, inner Some with a valid value → normalise and keep.
+        assert_eq!(
+            clean_optional_command(Some(Some("  npm run build  ".into()))),
+            Ok(Some(Some("npm run build".into())))
+        );
+
+        // Outer Some, inner Some with an empty/whitespace value → collapse to clear.
+        assert_eq!(
+            clean_optional_command(Some(Some("   ".into()))),
+            Ok(Some(None))
+        );
+
+        // Outer Some, inner Some with a value that fails clean_command validation.
+        assert!(clean_optional_command(Some(Some("echo a\nrm -rf b".into()))).is_err());
     }
 
     #[test]

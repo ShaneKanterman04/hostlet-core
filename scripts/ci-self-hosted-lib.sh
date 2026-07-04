@@ -136,6 +136,10 @@ discover_postgres_port() {
   printf '%s' "${port}"
 }
 
+ci_test_secret_value() {
+  printf 'ci-test-%s-value-000001' "$1"
+}
+
 # export_self_hosted_env <postgres-port> <api-port>: export the shared self-hosted
 # API configuration (mode, database URL, bind/public URLs, and the CI-only secret
 # set) used by both scripts. Caller adds any script-specific exports afterward.
@@ -150,12 +154,17 @@ export_self_hosted_env() {
   export PUBLIC_WEBHOOK_URL="http://127.0.0.1:${api_port}"
   export HOSTLET_ALLOWED_WEB_ORIGINS="http://127.0.0.1:3000"
   export HOSTLET_ALLOW_INSECURE_DEV_DEFAULTS=false
-  export HOSTLET_SETUP_TOKEN=ci-only-not-a-secret-setup-token-01
+  export HOSTLET_SETUP_TOKEN
+  HOSTLET_SETUP_TOKEN="$(ci_test_secret_value setup-token)"
   export HOSTLET_ALLOWED_GITHUB_LOGINS=ci-user
   export ENCRYPTION_KEY=YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=
-  export JOB_SIGNING_SECRET=ci-only-not-a-secret-job-signing-01
-  export SESSION_SECRET=ci-only-not-a-secret-session-secret-01
-  export LOCAL_AGENT_TOKEN=ci-only-not-a-secret-agent-token-01
-  export GITHUB_WEBHOOK_SECRET=ci-only-not-a-secret-webhook-secret-01
+  export JOB_SIGNING_SECRET
+  JOB_SIGNING_SECRET="$(ci_test_secret_value job-signing)"
+  export SESSION_SECRET
+  SESSION_SECRET="$(ci_test_secret_value session-secret)"
+  export LOCAL_AGENT_TOKEN
+  LOCAL_AGENT_TOKEN="$(ci_test_secret_value local-agent-token)"
+  export GITHUB_WEBHOOK_SECRET
+  GITHUB_WEBHOOK_SECRET="$(ci_test_secret_value webhook-secret)"
   export HOSTLET_UPDATE_CHECKS=false
 }
